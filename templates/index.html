@@ -304,12 +304,17 @@
     <div class="panel">
       <h2>邮箱来源</h2>
       <div class="radio-group">
-        <label><input type="radio" name="mode" value="outlook" checked> Outlook 自动取件</label>
-        <label><input type="radio" name="mode" value="manual"> 手动粘贴邮箱</label>
+        <label><input type="radio" name="mode" value="manual" checked> 自定义域名邮箱</label>
+        <label><input type="radio" name="mode" value="outlook"> Outlook 自动取件</label>
       </div>
       <div id="manual-box" style="display:none;">
         <label>邮箱列表（每行一个）</label>
-        <textarea id="emails" placeholder="支持两种格式，自动识别：&#10;1) email----password----client_id----refresh_token&#10;2) email:password::refresh_token:client_id::refresh_token&#10;每行一个"></textarea>
+        <div class="row" style="margin-bottom:10px;">
+          <div><input type="text" id="mail-name" placeholder="邮箱名称，留空则随机生成"></div>
+          <div><button id="create-mail" class="btn" type="button">创建邮箱并填入</button></div>
+        </div>
+        <div class="hint" id="create-mail-status" style="margin-bottom:8px;"></div>
+        <textarea id="emails" placeholder="每行一个邮箱地址，例如：&#10;name@example.com&#10;name2@example.com"></textarea>
         <div class="hint" id="email-count">0 行</div>
       </div>
       <div id="outlook-hint" class="hint">从 <code>用于注册的邮箱.json</code> 中按 status=available 自动抽取</div>
@@ -350,6 +355,20 @@
     <div class="panel">
       <div id="err-banner" class="err-banner"></div>
       <button id="start" class="btn btn--primary btn--lg">开始注册</button>
+    </div>
+
+    <div class="panel" id="otp-panel" style="display:none;">
+      <h2>验证码</h2>
+      <div class="hint" id="otp-hint" style="margin-bottom:8px;"></div>
+      <div class="row" style="margin-bottom:10px;">
+        <div><input type="text" id="mail-otp-address" placeholder="邮箱地址"></div>
+        <div><input type="text" id="mail-otp-jwt" placeholder="地址 JWT"></div>
+      </div>
+      <button id="fetch-mail-otp" class="btn" type="button" style="margin-bottom:10px;">从邮箱 API 获取验证码</button>
+      <div class="hint" id="mail-otp-status" style="margin-bottom:8px;"></div>
+      <input type="text" id="otp-code" placeholder="输入 6 位验证码" maxlength="6" inputmode="numeric">
+      <button id="submit-otp" class="btn btn--primary" style="margin-top:10px;">提交验证码</button>
+      <div class="hint" id="otp-status"></div>
     </div>
 
     <div class="panel">
@@ -437,6 +456,21 @@ const logEl = $('log');
 const autoscroll = $('autoscroll');
 const sseStatus = $('sse-status');
 const sseDot = $('sse-dot');
+const otpPanel = $('otp-panel');
+const otpHint = $('otp-hint');
+const otpCode = $('otp-code');
+const otpStatus = $('otp-status');
+const submitOtpBtn = $('submit-otp');
+const mailName = $('mail-name');
+const createMailBtn = $('create-mail');
+const createMailStatus = $('create-mail-status');
+const mailOtpAddress = $('mail-otp-address');
+const mailOtpJwt = $('mail-otp-jwt');
+const fetchMailOtpBtn = $('fetch-mail-otp');
+const mailOtpStatus = $('mail-otp-status');
+let mailOtpPollTimer = null;
+let mailOtpPolling = false;
+let mailOtpFound = false;
 
 function currentMode() {
   return document.querySelector('input[name="mode"]:checked').value;
@@ -452,6 +486,127 @@ updateModeUI();
 emailsTa.addEventListener('input', () => {
   const n = emailsTa.value.split('\n').filter(l => l.trim()).length;
   emailCount.textContent = n + ' 行';
+});
+
+function refreshEmailCount() {
+  const n = emailsTa.value.split('\n').filter(l => l.trim()).length;
+  emailCount.textContent = n + ' 行';
+}
+
+createMailBtn.addEventListener('click', async () => {
+  showError('');
+  createMailStatus.textContent = '';
+  createMailBtn.disabled = true;
+  createMailBtn.textContent = '创建中…';
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 25000);
+    const resp = await fetch('/api/custom-mail/new-address', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: mailName.value.trim()}),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      createMailStatus.innerHTML = `<span class="err-text">${data.error || ('HTTP ' + resp.status)}</span>`;
+      return;
+    }
+    const prefix = emailsTa.value.trim() ? emailsTa.value.trimEnd() + '\n' : '';
+    emailsTa.value = prefix + data.address + '\n';
+    mailOtpAddress.value = data.address || '';
+    mailOtpJwt.value = data.jwt || '';
+    if (data.jwt) {
+      const saved = JSON.parse(localStorage.getItem('xjgpt-mail-jwts') || '{}');
+      saved[data.address] = data.jwt;
+      localStorage.setItem('xjgpt-mail-jwts', JSON.stringify(saved));
+    }
+    mailName.value = '';
+    refreshEmailCount();
+    createMailStatus.innerHTML = `<span class="ok-text">已创建并填入：${data.address}</span>`;
+  } catch (e) {
+    const msg = e.name === 'AbortError' ? '创建邮箱请求超时，请检查代理或 Worker 可访问性' : String(e);
+    createMailStatus.innerHTML = `<span class="err-text">${msg}</span>`;
+  } finally {
+    createMailBtn.disabled = false;
+    createMailBtn.textContent = '创建邮箱并填入';
+  }
+});
+
+async function fetchMailOtpOnce({silent = false} = {}) {
+  if (mailOtpFound || (!mailOtpPolling && silent)) return true;
+  showError('');
+  if (!silent) mailOtpStatus.textContent = '';
+  let address = mailOtpAddress.value.trim();
+  let jwt = mailOtpJwt.value.trim();
+  if (!address) {
+    address = (emailsTa.value.split('\n').find(l => l.trim()) || '').trim();
+    mailOtpAddress.value = address;
+  }
+  if (address && !jwt) {
+    const saved = JSON.parse(localStorage.getItem('xjgpt-mail-jwts') || '{}');
+    jwt = saved[address] || '';
+    mailOtpJwt.value = jwt;
+  }
+  if (!jwt) {
+    if (!silent) mailOtpStatus.innerHTML = '<span class="err-text">请填写该邮箱对应的地址 JWT</span>';
+    return false;
+  }
+
+  fetchMailOtpBtn.disabled = true;
+  fetchMailOtpBtn.textContent = '获取中…';
+  try {
+    const resp = await fetch('/api/custom-mail/latest-otp', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({address, jwt}),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      mailOtpStatus.innerHTML = silent
+        ? `<span class="warn-text">等待验证码中… ${data.error || ('HTTP ' + resp.status)}</span>`
+        : `<span class="err-text">${data.error || ('HTTP ' + resp.status)}</span>`;
+      return false;
+    }
+    otpCode.value = data.otp;
+    mailOtpStatus.innerHTML = `<span class="ok-text">已提取验证码：${data.otp}</span>`;
+    mailOtpFound = true;
+    stopMailOtpPolling();
+    return true;
+  } catch (e) {
+    mailOtpStatus.innerHTML = silent
+      ? `<span class="warn-text">等待验证码中… ${e}</span>`
+      : `<span class="err-text">${e}</span>`;
+    return false;
+  } finally {
+    fetchMailOtpBtn.disabled = false;
+    fetchMailOtpBtn.textContent = '从邮箱 API 获取验证码';
+  }
+}
+
+function startMailOtpPolling() {
+  if (mailOtpPolling) return;
+  if (/^\d{6}$/.test(otpCode.value.trim())) return;
+  mailOtpFound = false;
+  mailOtpPolling = true;
+  mailOtpStatus.innerHTML = '<span class="warn-text">正在每 5 秒查询验证码…</span>';
+  fetchMailOtpOnce({silent: true});
+  mailOtpPollTimer = setInterval(() => {
+    fetchMailOtpOnce({silent: true});
+  }, 5000);
+}
+
+function stopMailOtpPolling() {
+  mailOtpPolling = false;
+  if (mailOtpPollTimer) {
+    clearInterval(mailOtpPollTimer);
+    mailOtpPollTimer = null;
+  }
+}
+
+fetchMailOtpBtn.addEventListener('click', async () => {
+  await fetchMailOtpOnce();
 });
 
 function showError(msg) {
@@ -473,6 +628,7 @@ startBtn.addEventListener('click', async () => {
   if (mode === 'manual') {
     const n = emails.split('\n').filter(l => l.trim()).length;
     if (n < count) { showError(`手动模式需要至少 ${count} 行邮箱，当前 ${n} 行`); return; }
+    if (workers !== 1) { showError('手动邮箱模式需要并发=1'); return; }
   }
 
   startBtn.disabled = true;
@@ -495,6 +651,44 @@ startBtn.addEventListener('click', async () => {
     startBtn.disabled = false;
     startBtn.textContent = '开始注册';
   }
+});
+
+submitOtpBtn.addEventListener('click', async () => {
+  showError('');
+  otpStatus.textContent = '';
+  const code = otpCode.value.trim();
+  if (!/^\d{6}$/.test(code)) {
+    otpStatus.innerHTML = '<span class="err-text">验证码必须是 6 位数字</span>';
+    return;
+  }
+  submitOtpBtn.disabled = true;
+  submitOtpBtn.textContent = '提交中…';
+  try {
+    const resp = await fetch('/api/otp', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({code}),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      otpStatus.innerHTML = `<span class="err-text">${data.error || ('HTTP ' + resp.status)}</span>`;
+      submitOtpBtn.disabled = false;
+      submitOtpBtn.textContent = '提交验证码';
+      return;
+    }
+    otpStatus.innerHTML = '<span class="ok-text">已提交，继续注册中…</span>';
+    otpCode.value = '';
+    mailOtpFound = false;
+  } catch (e) {
+    otpStatus.innerHTML = `<span class="err-text">${e}</span>`;
+  } finally {
+    submitOtpBtn.disabled = false;
+    submitOtpBtn.textContent = '提交验证码';
+  }
+});
+
+otpCode.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') submitOtpBtn.click();
 });
 
 $('clear-log').addEventListener('click', () => { logEl.textContent = ''; });
@@ -653,6 +847,21 @@ async function pollStatus() {
     $('s-done').textContent    = s.done    || 0;
     $('s-success').textContent = s.success || 0;
     $('s-failed').textContent  = s.failed  || 0;
+    if (s.otp_waiting) {
+      otpPanel.style.display = 'block';
+      otpHint.innerHTML = `请查看 <code>${s.otp_email || ''}</code> 收到的邮件，并在这里输入验证码。`;
+      if (s.otp_email && mailOtpAddress.value !== s.otp_email) {
+        mailOtpAddress.value = s.otp_email;
+        const saved = JSON.parse(localStorage.getItem('xjgpt-mail-jwts') || '{}');
+        if (saved[s.otp_email]) mailOtpJwt.value = saved[s.otp_email];
+      }
+      startMailOtpPolling();
+      otpCode.focus();
+    } else {
+      stopMailOtpPolling();
+      otpPanel.style.display = 'none';
+      otpStatus.textContent = '';
+    }
     const badge = $('run-badge');
     if (s.running) {
       badge.textContent = `运行中 · ${s.mode}`;

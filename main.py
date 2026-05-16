@@ -158,6 +158,7 @@ def run_registration(
     birthday: str = "2000-01-01",
     proxy: str = None,
     otp_code: str = None,
+    otp_callback=None,
     batch_dir=None,
 ):
     """
@@ -173,6 +174,7 @@ def run_registration(
         birthday: 生日，格式 YYYY-MM-DD
         proxy: 代理地址（不传则从 PROXY_POOL 随机抽）
         otp_code: 邮箱验证码（如果为None，会等待手动输入）
+        otp_callback: 可选回调，用于 Web GUI 等非命令行环境获取验证码
     """
     # 创建浏览器会话（proxy=None 时自动从 config.PROXY_POOL 随机抽一个）
     session = BrowserSession(proxy=proxy)
@@ -232,7 +234,10 @@ def run_registration(
 
         # 等待验证码：USE_EMAIL_SERVICE=True 时自动从 Outlook 取件，否则人工输入
         if otp_code is None:
-            if USE_EMAIL_SERVICE:
+            if otp_callback is not None:
+                logger.info(f"[OTP] 等待页面输入验证码：{email}")
+                otp_code = otp_callback(email, otp_after_ts)
+            elif USE_EMAIL_SERVICE:
                 logger.info(f"[OTP] 等待验证码：{email}")
                 otp_code = wait_for_otp(email, after_ts=otp_after_ts)
             else:

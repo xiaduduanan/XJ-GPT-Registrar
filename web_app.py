@@ -10,14 +10,19 @@ XJ-GPT 协议注册机 Web GUI。
     python web_app.py --host 0.0.0.0  # 暴露到局域网(自担风险)
 """
 import argparse
+import email
+import html
 import json
 import logging
 import queue
+import random
 import re
+import string
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
+from email import policy
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -27,7 +32,8 @@ from config import proxy as proxy_config
 from config import geo as geo_config
 from core.account_export import create_batch_archive_dir
 from core.email_provider import acquire_email
-from core.outlook_client import OutlookAccount, _CONTEXT_CACHE
+from core.otp_utils import extract_otp
+from core.outlook_client import OutlookAccount
 from main import generate_display_name, run_registration
 
 
@@ -52,7 +58,17 @@ _BATCH_STATE: dict = {
     "success": 0,
     "failed": 0,
     "last_error": None,
+    "otp_waiting": False,
+    "otp_email": None,
     "results": [],
+}
+
+_OTP_CONDITION = threading.Condition()
+_OTP_REQUEST: dict = {
+    "waiting": False,
+    "email": None,
+    "code": None,
+    "requested_at": None,
 }
 
 
@@ -69,6 +85,8 @@ def _reset_state(mode: str, target: int) -> None:
             "success": 0,
             "failed": 0,
             "last_error": None,
+            "otp_waiting": False,
+            "otp_email": None,
             "results": [],
         })
 
@@ -96,6 +114,40 @@ def _record_result(result: dict) -> None:
             "account_id": result.get("account_id"),
             "flow": result.get("flow", {}).get("status") if isinstance(result.get("flow"), dict) else None,
         })
+
+
+def _parse_manual_email(line: str) -> str:
+    email = line.strip()
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        raise ValueError(f"邮箱格式错误: {email[:80]}")
+    return email
+
+
+def _wait_for_gui_otp(email: str, after_ts: float) -> str:
+    del after_ts
+    with _OTP_CONDITION:
+        _OTP_REQUEST.update({
+            "waiting": True,
+            "email": email,
+            "code": None,
+            "requested_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        with _STATE_LOCK:
+            _BATCH_STATE["otp_waiting"] = True
+            _BATCH_STATE["otp_email"] = email
+        logger.info(f"[OTP] 请在页面输入 {email} 收到的 6 位验证码")
+
+        while _OTP_REQUEST["waiting"] and not _OTP_REQUEST["code"]:
+            _OTP_CONDITION.wait(timeout=1.0)
+
+        code = str(_OTP_REQUEST.get("code") or "").strip()
+        _OTP_REQUEST.update({"waiting": False, "email": None, "code": None})
+        with _STATE_LOCK:
+            _BATCH_STATE["otp_waiting"] = False
+            _BATCH_STATE["otp_email"] = None
+        if not re.fullmatch(r"\d{6}", code):
+            raise ValueError("验证码必须是 6 位数字")
+        return code
 
 
 # ============================================================
@@ -194,9 +246,7 @@ def _gui_run_batch(
         email_queue: "queue.Queue[str]" = queue.Queue()
         if mode == "manual":
             for line in manual_lines:
-                acc = _parse_manual_line(line)
-                _CONTEXT_CACHE[acc.email] = acc
-                email_queue.put(acc.email)
+                email_queue.put(_parse_manual_email(line))
 
         def next_email() -> str:
             if mode == "manual":
@@ -214,6 +264,7 @@ def _gui_run_batch(
                     email=email,
                     name=name,
                     birthday="2000-01-01",
+                    otp_callback=_wait_for_gui_otp if mode == "manual" else None,
                     batch_dir=batch_dir,
                 )
             except Exception as exc:
@@ -274,6 +325,78 @@ def _gui_run_batch(
 app = Flask(__name__)
 
 
+def _random_mailbox_name() -> str:
+    letters1 = "".join(random.choices(string.ascii_lowercase, k=5))
+    numbers = "".join(random.choices(string.digits, k=random.randint(1, 3)))
+    letters2 = "".join(random.choices(string.ascii_lowercase, k=random.randint(1, 3)))
+    return letters1 + numbers + letters2
+
+
+def _mail_response_items(data) -> list:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("mails", "data", "items", "results", "messages"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def _find_raw_mime(item) -> str:
+    if isinstance(item, str):
+        return item
+    if not isinstance(item, dict):
+        return ""
+    for key in ("raw", "source", "content", "mime", "eml"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    for value in item.values():
+        if isinstance(value, dict):
+            found = _find_raw_mime(value)
+            if found:
+                return found
+    return ""
+
+
+def _decode_part(part) -> str:
+    payload = part.get_payload(decode=True)
+    if payload is None:
+        text = part.get_payload()
+        return text if isinstance(text, str) else ""
+    charset = part.get_content_charset() or "utf-8"
+    return payload.decode(charset, errors="replace")
+
+
+def _parse_raw_mail(raw: str) -> dict:
+    msg = email.message_from_string(raw, policy=policy.default)
+    text_parts: list[str] = []
+    html_parts: list[str] = []
+
+    if msg.is_multipart():
+        parts = msg.walk()
+    else:
+        parts = [msg]
+
+    for part in parts:
+        content_type = part.get_content_type()
+        if part.get_content_maintype() == "multipart":
+            continue
+        if content_type == "text/plain":
+            text_parts.append(_decode_part(part))
+        elif content_type == "text/html":
+            html_parts.append(_decode_part(part))
+
+    html_text = "\n".join(html_parts)
+    return {
+        "subject": str(msg.get("subject") or ""),
+        "from": str(msg.get("from") or ""),
+        "text": "\n".join(text_parts),
+        "html": html.unescape(re.sub(r"<[^>]+>", " ", html_text)),
+    }
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -282,6 +405,185 @@ def index():
 @app.route("/api/status")
 def api_status():
     return jsonify(_snapshot_state())
+
+
+@app.route("/api/otp", methods=["POST"])
+def api_otp_submit():
+    data = request.get_json(silent=True) or {}
+    code = str(data.get("code", "")).strip()
+    if not re.fullmatch(r"\d{6}", code):
+        return jsonify({"ok": False, "error": "验证码必须是 6 位数字"}), 400
+
+    with _OTP_CONDITION:
+        if not _OTP_REQUEST.get("waiting"):
+            return jsonify({"ok": False, "error": "当前没有等待验证码的任务"}), 409
+        _OTP_REQUEST["code"] = code
+        email = _OTP_REQUEST.get("email")
+        _OTP_CONDITION.notify_all()
+
+    logger.info(f"[OTP] 已从页面收到验证码：{email}")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/custom-mail/new-address", methods=["POST"])
+def api_custom_mail_new_address():
+    logger.info("[CustomMail] 收到创建邮箱请求")
+    try:
+        from config import custom_mail
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"读取邮箱 API 配置失败: {exc}"}), 500
+
+    base = (custom_mail.MAIL_API_BASE or "").rstrip("/")
+    admin_auth = custom_mail.ADMIN_AUTH or ""
+    domain = custom_mail.MAIL_DOMAIN or ""
+    custom_auth = custom_mail.CUSTOM_AUTH or ""
+
+    if not base or not admin_auth or not domain:
+        return jsonify({
+            "ok": False,
+            "error": "请先配置 config/custom_mail.py 里的 MAIL_API_BASE、ADMIN_AUTH、MAIL_DOMAIN",
+        }), 400
+
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name") or "").strip() or _random_mailbox_name()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
+        return jsonify({"ok": False, "error": "邮箱名称只能包含字母、数字、点、下划线和短横线"}), 400
+
+    payload_data = {
+        "enablePrefix": bool(custom_mail.ENABLE_PREFIX),
+        "name": name,
+        "domain": domain,
+    }
+    headers = {
+        "x-admin-auth": admin_auth,
+        "Content-Type": "application/json",
+    }
+    if custom_auth:
+        headers["x-custom-auth"] = custom_auth
+
+    url = f"{base}/admin/new_address"
+    try:
+        from curl_cffi.requests import Session
+
+        proxy_url = proxy_config.pick_proxy()
+        debug_headers = dict(headers)
+        if debug_headers.get("x-admin-auth"):
+            debug_headers["x-admin-auth"] = "***"
+        if debug_headers.get("x-custom-auth"):
+            debug_headers["x-custom-auth"] = "***"
+        logger.info(
+            "[CustomMail] 请求: POST %s proxy=%s headers=%s body=%s",
+            url,
+            proxy_url or "(直连)",
+            debug_headers,
+            json.dumps(payload_data, ensure_ascii=False),
+        )
+        session = Session(impersonate="chrome142")
+        if proxy_url:
+            session.proxies = {"http": proxy_url, "https": proxy_url}
+        resp = session.post(url, json=payload_data, headers=headers, timeout=25)
+        logger.info("[CustomMail] 响应: HTTP %s body=%s", resp.status_code, resp.text[:2000])
+        if resp.status_code >= 400:
+            return jsonify({
+                "ok": False,
+                "error": f"HTTP {resp.status_code}: {resp.text[:500]}",
+            }), 502
+        result = resp.json()
+    except Exception as exc:
+        logger.exception("[CustomMail] 创建邮箱失败")
+        return jsonify({
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }), 502
+
+    address = result.get("address")
+    if not address:
+        return jsonify({"ok": False, "error": f"接口响应缺少 address: {result}"}), 502
+
+    logger.info(f"[CustomMail] 已创建邮箱地址: {address}")
+    return jsonify({
+        "ok": True,
+        "address": address,
+        "jwt": result.get("jwt"),
+        "address_id": result.get("address_id"),
+    })
+
+
+@app.route("/api/custom-mail/latest-otp", methods=["POST"])
+def api_custom_mail_latest_otp():
+    try:
+        from config import custom_mail
+        from curl_cffi.requests import Session
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"初始化邮箱 API 失败: {exc}"}), 500
+
+    base = (custom_mail.MAIL_API_BASE or "").rstrip("/")
+    custom_auth = custom_mail.CUSTOM_AUTH or ""
+    data = request.get_json(silent=True) or {}
+    address = str(data.get("address") or "").strip()
+    jwt = str(data.get("jwt") or "").strip()
+    if not base:
+        return jsonify({"ok": False, "error": "请先配置 config/custom_mail.py 里的 MAIL_API_BASE"}), 400
+    if not jwt:
+        return jsonify({"ok": False, "error": "请填写该邮箱地址对应的地址 JWT"}), 400
+
+    headers = {
+        "Authorization": f"Bearer {jwt}",
+        "Content-Type": "application/json",
+    }
+    if custom_auth:
+        headers["x-custom-auth"] = custom_auth
+
+    url = f"{base}/api/mails?limit=10&offset=0"
+    proxy_url = proxy_config.pick_proxy()
+    debug_headers = dict(headers)
+    debug_headers["Authorization"] = "Bearer ***"
+    if debug_headers.get("x-custom-auth"):
+        debug_headers["x-custom-auth"] = "***"
+    logger.info(
+        "[CustomMail] 拉取邮件: GET %s address=%s proxy=%s headers=%s",
+        url,
+        address or "(未指定)",
+        proxy_url or "(直连)",
+        debug_headers,
+    )
+
+    try:
+        session = Session(impersonate="chrome142")
+        if proxy_url:
+            session.proxies = {"http": proxy_url, "https": proxy_url}
+        resp = session.get(url, headers=headers, timeout=25)
+        logger.info("[CustomMail] 邮件响应: HTTP %s body=%s", resp.status_code, resp.text[:2000])
+        if resp.status_code >= 400:
+            return jsonify({"ok": False, "error": f"HTTP {resp.status_code}: {resp.text[:500]}"}), 502
+        payload = resp.json()
+    except Exception as exc:
+        logger.exception("[CustomMail] 拉取邮件失败")
+        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 502
+
+    items = _mail_response_items(payload)
+    scanned = 0
+    for item in items:
+        scanned += 1
+        mail_item = item if isinstance(item, dict) else {}
+        raw = _find_raw_mime(item)
+        if raw:
+            mail_item = {**mail_item, **_parse_raw_mail(raw)}
+        otp = extract_otp(mail_item)
+        if otp:
+            return jsonify({
+                "ok": True,
+                "otp": otp,
+                "subject": mail_item.get("subject") or "",
+                "from": mail_item.get("from") or mail_item.get("sendEmail") or "",
+                "scanned": scanned,
+            })
+
+    return jsonify({
+        "ok": False,
+        "error": f"最近 {len(items)} 封邮件里没有找到 6 位验证码",
+        "scanned": len(items),
+    }), 404
 
 
 _ALLOWED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
@@ -523,7 +825,7 @@ def api_geo_detect():
 def api_start():
     data = request.get_json(silent=True) or {}
 
-    mode = data.get("mode", "outlook")
+    mode = data.get("mode", "manual")
     if mode not in ("manual", "outlook"):
         return jsonify({"ok": False, "error": "mode 必须是 manual 或 outlook"}), 400
 
@@ -538,6 +840,8 @@ def api_start():
 
     if workers > count:
         workers = count
+    if mode == "manual" and workers != 1:
+        return jsonify({"ok": False, "error": "手动邮箱模式需要并发=1，避免多个验证码同时等待"}), 400
 
     continue_on_fail = bool(data.get("continue_on_fail", True))
 
@@ -555,7 +859,7 @@ def api_start():
             }), 400
         try:
             for ln in manual_lines[:count]:
-                _parse_manual_line(ln)
+                _parse_manual_email(ln)
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
