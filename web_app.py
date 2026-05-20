@@ -26,7 +26,7 @@ from email import policy
 from pathlib import Path
 from urllib.parse import urlparse
 
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, make_response, render_template, request
 
 from config import proxy as proxy_config
 from config import geo as geo_config
@@ -325,6 +325,22 @@ def _gui_run_batch(
 app = Flask(__name__)
 
 
+def _cors_json(payload: dict, status: int = 200):
+    resp = make_response(jsonify(payload), status)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    return resp
+
+
+def _cors_options():
+    resp = make_response("", 204)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    return resp
+
+
 def _random_mailbox_name() -> str:
     letters1 = "".join(random.choices(string.ascii_lowercase, k=5))
     numbers = "".join(random.choices(string.digits, k=random.randint(1, 3)))
@@ -423,6 +439,81 @@ def api_otp_submit():
 
     logger.info(f"[OTP] 已从页面收到验证码：{email}")
     return jsonify({"ok": True})
+
+
+@app.route("/api/outlook/available", methods=["GET", "OPTIONS"])
+def api_outlook_available():
+    if request.method == "OPTIONS":
+        return _cors_options()
+    try:
+        from core.db import list_outlook_pool, outlook_pool_summary
+        from core.outlook_client import import_outlook_from_file
+
+        inserted, skipped = import_outlook_from_file()
+        rows = list_outlook_pool(status="available", limit=20)
+        accounts = [
+            {
+                "id": row.get("id"),
+                "email": row.get("email"),
+                "status": row.get("status"),
+            }
+            for row in rows
+        ]
+        logger.info(
+            f"[OutlookAPI] 查询可用邮箱: available={len(accounts)}, imported={inserted}, skipped={skipped}"
+        )
+        return _cors_json({
+            "ok": True,
+            "accounts": accounts,
+            "first": accounts[0] if accounts else None,
+            "summary": outlook_pool_summary(),
+            "imported": inserted,
+            "skipped": skipped,
+        })
+    except Exception as exc:
+        logger.exception("[OutlookAPI] 查询可用邮箱失败")
+        return _cors_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
+
+
+@app.route("/api/outlook/latest-otp", methods=["POST", "OPTIONS"])
+def api_outlook_latest_otp():
+    if request.method == "OPTIONS":
+        return _cors_options()
+    data = request.get_json(silent=True) or {}
+    email_addr = str(data.get("email") or "").strip()
+    if not email_addr:
+        return _cors_json({"ok": False, "error": "缺少 email 字段"}, 400)
+
+    try:
+        from core.outlook_client import fetch_latest_otp, get_account_context, import_outlook_from_file
+
+        import_outlook_from_file()
+        if get_account_context(email_addr) is None:
+            return _cors_json({"ok": False, "error": f"未找到 {email_addr} 的 Outlook 上下文"}, 404)
+
+        after_ts = data.get("after_ts")
+        try:
+            after_ts = float(after_ts) if after_ts is not None else None
+        except (TypeError, ValueError):
+            return _cors_json({"ok": False, "error": "after_ts 必须是数字时间戳"}, 400)
+
+        max_wait = int(data.get("max_wait", 15))
+        poll_interval = int(data.get("poll_interval", 3))
+        max_wait = max(1, min(max_wait, 90))
+        poll_interval = max(1, min(poll_interval, 10))
+
+        otp = fetch_latest_otp(
+            email_addr,
+            after_ts=after_ts,
+            max_wait=max_wait,
+            poll_interval=poll_interval,
+            settle_seconds=0,
+        )
+        logger.info(f"[OutlookAPI] 已获取 OTP: {email_addr}")
+        return _cors_json({"ok": True, "email": email_addr, "otp": otp})
+    except Exception as exc:
+        logger.warning(f"[OutlookAPI] 获取 OTP 失败: {email_addr}: {type(exc).__name__}: {exc}")
+        return _cors_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 502)
 
 
 @app.route("/api/custom-mail/new-address", methods=["POST"])

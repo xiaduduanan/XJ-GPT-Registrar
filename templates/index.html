@@ -494,6 +494,10 @@ function refreshEmailCount() {
 }
 
 createMailBtn.addEventListener('click', async () => {
+  await createMailAddress();
+});
+
+async function createMailAddress() {
   showError('');
   createMailStatus.textContent = '';
   createMailBtn.disabled = true;
@@ -511,7 +515,7 @@ createMailBtn.addEventListener('click', async () => {
     const data = await resp.json();
     if (!resp.ok || !data.ok) {
       createMailStatus.innerHTML = `<span class="err-text">${data.error || ('HTTP ' + resp.status)}</span>`;
-      return;
+      return false;
     }
     const prefix = emailsTa.value.trim() ? emailsTa.value.trimEnd() + '\n' : '';
     emailsTa.value = prefix + data.address + '\n';
@@ -525,14 +529,16 @@ createMailBtn.addEventListener('click', async () => {
     mailName.value = '';
     refreshEmailCount();
     createMailStatus.innerHTML = `<span class="ok-text">已创建并填入：${data.address}</span>`;
+    return true;
   } catch (e) {
     const msg = e.name === 'AbortError' ? '创建邮箱请求超时，请检查代理或 Worker 可访问性' : String(e);
     createMailStatus.innerHTML = `<span class="err-text">${msg}</span>`;
+    return false;
   } finally {
     createMailBtn.disabled = false;
     createMailBtn.textContent = '创建邮箱并填入';
   }
-});
+}
 
 async function fetchMailOtpOnce({silent = false} = {}) {
   if (mailOtpFound || (!mailOtpPolling && silent)) return true;
@@ -573,6 +579,7 @@ async function fetchMailOtpOnce({silent = false} = {}) {
     mailOtpStatus.innerHTML = `<span class="ok-text">已提取验证码：${data.otp}</span>`;
     mailOtpFound = true;
     stopMailOtpPolling();
+    await submitOtp(otpCode.value);
     return true;
   } catch (e) {
     mailOtpStatus.innerHTML = silent
@@ -621,14 +628,25 @@ startBtn.addEventListener('click', async () => {
   const count = parseInt($('count').value, 10);
   const workers = parseInt($('workers').value, 10);
   const continue_on_fail = $('continue-on-fail').checked;
-  const emails = emailsTa.value;
+  let emails = emailsTa.value;
 
   if (!count || count < 1) { showError('数量必须 >= 1'); return; }
   if (!workers || workers < 1) { showError('并发必须 >= 1'); return; }
   if (mode === 'manual') {
     const n = emails.split('\n').filter(l => l.trim()).length;
-    if (n < count) { showError(`手动模式需要至少 ${count} 行邮箱，当前 ${n} 行`); return; }
     if (workers !== 1) { showError('手动邮箱模式需要并发=1'); return; }
+    if (n < count) {
+      if (count !== 1) { showError('自动创建邮箱时数量请先设为 1'); return; }
+      startBtn.disabled = true;
+      startBtn.textContent = '创建邮箱中…';
+      const created = await createMailAddress();
+      if (!created) {
+        startBtn.disabled = false;
+        startBtn.textContent = '开始注册';
+        return;
+      }
+      emails = emailsTa.value;
+    }
   }
 
   startBtn.disabled = true;
@@ -653,10 +671,10 @@ startBtn.addEventListener('click', async () => {
   }
 });
 
-submitOtpBtn.addEventListener('click', async () => {
+async function submitOtp(codeOverride = null) {
   showError('');
   otpStatus.textContent = '';
-  const code = otpCode.value.trim();
+  const code = String(codeOverride ?? otpCode.value).trim();
   if (!/^\d{6}$/.test(code)) {
     otpStatus.innerHTML = '<span class="err-text">验证码必须是 6 位数字</span>';
     return;
@@ -685,10 +703,12 @@ submitOtpBtn.addEventListener('click', async () => {
     submitOtpBtn.disabled = false;
     submitOtpBtn.textContent = '提交验证码';
   }
-});
+}
+
+submitOtpBtn.addEventListener('click', submitOtp);
 
 otpCode.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') submitOtpBtn.click();
+  if (e.key === 'Enter') submitOtp();
 });
 
 $('clear-log').addEventListener('click', () => { logEl.textContent = ''; });
