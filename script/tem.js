@@ -9,7 +9,10 @@
 // @match        https://pay.openai.com/*
 // @match        https://checkout.stripe.com/*
 // @match        https://chatgpt.com/*
+// @match        https://chat.openai.com/*
 // @match        https://auth.openai.com/*
+// @match        http://localhost:*/*
+// @match        http://127.0.0.1:*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @grant        GM_setClipboard
@@ -18,15 +21,18 @@
 // @connect      meiguodizhi.com
 // @connect      127.0.0.1
 // @connect      localhost
+// @connect      *
 // @run-at       document-idle
 // ==/UserScript==
 
 // 使用 GM_getValue 读取本地保存的配置，如果没有则使用默认值
 var CONFIG = {
     phone: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_phone', '83890239615') : '83890239615',
-    cardNumber: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardNumber', '5436103552508504') : '5436103552508504',
-    cardExpiry: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardExpiry', '05 / 29') : '05 / 29',
-    cardCvv: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardCvv', '717') : '717'
+    cardNumber: '',
+    cardExpiry: '',
+    cardCvv: '',
+    cpaUrl: typeof GM_getValue !== 'undefined' ? GM_getValue('cpa_url', '') : '',
+    cpaKey: typeof GM_getValue !== 'undefined' ? GM_getValue('cpa_key', '') : ''
 };
 
 (function() {
@@ -35,9 +41,69 @@ var CONFIG = {
     // 全局运行状态：'RUNNING', 'PAUSED', 'STOPPED'
     var STATE = 'RUNNING';
 
+    function redactSensitiveProfileData(data) {
+        console.log(22222)
+        return JSON.parse(JSON.stringify(data || {}));
+    }
+
+    function fetchMeiguoProfileForConsole() {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: 'https://www.meiguodizhi.com/api/v1/dz',
+                headers: { 'Accept': '*/*', 'Content-Type': 'application/json' },
+                data: JSON.stringify({ city: '', path: '/', method: 'refresh' }),
+                onload: function(r) {
+                    try {
+                        var data = JSON.parse(r.responseText || '{}');
+                        var safeData = redactSensitiveProfileData(data);
+                        console.log('[XJ-GPT] meiguodizhi response (redacted):', safeData);
+                        resolve(safeData);
+                    } catch (e) {
+                        reject(e);
+                    }
+                },
+                onerror: function() { reject(new Error('meiguodizhi request failed')); },
+                ontimeout: function() { reject(new Error('meiguodizhi request timeout')); }
+            });
+        });
+    }
+
+    function installChatgptProfileConsoleButton() {
+        if (!window.location.host.includes('chatgpt.com') && !window.location.host.includes('chat.openai.com')) return;
+        if (document.getElementById('xj-fetch-profile-console')) return;
+        var btn = document.createElement('button');
+        btn.id = 'xj-fetch-profile-console';
+        btn.textContent = 'Fetch profile to console';
+        btn.style.cssText = 'position:fixed!important;right:20px!important;top:80px!important;z-index:2147483647!important;padding:12px 14px!important;border:0!important;border-radius:6px!important;background:#16a085!important;color:#fff!important;font:600 13px Arial,sans-serif!important;box-shadow:0 4px 12px rgba(0,0,0,.35)!important;cursor:pointer!important;';
+        btn.addEventListener('click', async function() {
+            btn.disabled = true;
+            btn.textContent = 'Fetching...';
+            try {
+                await fetchMeiguoProfileForConsole();
+                btn.textContent = 'Printed to console';
+            } catch (e) {
+                console.error('[XJ-GPT] profile fetch failed:', e);
+                btn.textContent = 'Fetch failed';
+            }
+            setTimeout(() => {
+                btn.disabled = false;
+                btn.textContent = 'Fetch profile to console';
+            }, 2000);
+        });
+        (document.body || document.documentElement).appendChild(btn);
+    }
+
+    function keepChatgptProfileConsoleButtonAlive() {
+        installChatgptProfileConsoleButton();
+        if (window.__xjProfileConsoleButtonTimer) return;
+        window.__xjProfileConsoleButtonTimer = setInterval(installChatgptProfileConsoleButton, 1000);
+    }
+
     // ========== 1. 悬浮窗及日志/进度系统 ==========
     var logBox, progressBar, progressText, stepDesc;
     function initUI() {
+        installChatgptProfileConsoleButton();
         // 强制注入样式（增加了配置表单的样式）
         GM_addStyle(`
             #pp-auto-panel { position:fixed !important; bottom:20px !important; right:20px !important; width:320px !important; background:rgba(30,30,30,0.95) !important; border:1px solid #444 !important; border-radius:8px !important; box-shadow:0 4px 12px rgba(0,0,0,0.5) !important; color:#fff !important; z-index:2147483647 !important; font-family:sans-serif !important; font-size:13px !important; display:flex !important; flex-direction:column !important; backdrop-filter:blur(5px) !important; text-align:left !important; line-height:1.5 !important; }
@@ -54,6 +120,8 @@ var CONFIG = {
             .pp-input-group input:focus { border-color: #4db8ff !important; }
             #pp-btn-save-cfg { width: 100% !important; margin-top: 5px !important; background: #2ecc71 !important; color: white !important; padding: 6px !important; border: none !important; border-radius: 4px !important; cursor: pointer !important; font-size: 12px !important; font-weight: bold !important; transition: background 0.2s !important; }
             #pp-btn-save-cfg:hover { background: #27ae60 !important; }
+            #pp-btn-clear-card { width: 100% !important; margin-top: 5px !important; background: #555 !important; color: white !important; padding: 6px !important; border: none !important; border-radius: 4px !important; cursor: pointer !important; font-size: 12px !important; font-weight: bold !important; transition: background 0.2s !important; }
+            #pp-btn-clear-card:hover { background: #666 !important; }
 
             .pp-progress-container { padding:10px !important; border-bottom:1px solid #555 !important; background:transparent !important; }
             .pp-progress-info { display:flex !important; justify-content:space-between !important; margin-bottom:6px !important; font-size:12px !important; }
@@ -93,6 +161,7 @@ var CONFIG = {
                     <div class="pp-input-group"><label>有效期</label><input type="text" id="pp-cfg-expiry" value="${CONFIG.cardExpiry}"></div>
                     <div class="pp-input-group"><label>CVV</label><input type="text" id="pp-cfg-cvv" value="${CONFIG.cardCvv}"></div>
                     <button id="pp-btn-save-cfg">💾 保存并应用配置</button>
+                    <button id="pp-btn-clear-card">自动获取卡片信息</button>
                 </details>
 
                 <!-- 进度条区域 -->
@@ -133,6 +202,7 @@ var CONFIG = {
         var btnPause = document.getElementById('pp-btn-pause');
         var btnStop = document.getElementById('pp-btn-stop');
         var btnSaveCfg = document.getElementById('pp-btn-save-cfg');
+        var btnClearCard = document.getElementById('pp-btn-clear-card');
         var btnGetLink = document.getElementById('pp-btn-getlink');
         var btnCopyToken = document.getElementById('pp-btn-copytoken');
         var btnOutlookEmail = document.getElementById('pp-btn-outlook-email');
@@ -174,6 +244,30 @@ var CONFIG = {
         }
 
         // ====== ChatGPT 专属功能 ======
+        if (btnClearCard) {
+            btnClearCard.addEventListener('click', function () {
+                fetchMeiguoProfileForConsole().then(r => {
+                    console.log('接口返回:', r);
+
+
+                    document.getElementById('pp-cfg-card').value = r.address.Credit_Card_Number;
+                    document.getElementById('pp-cfg-expiry').value = r.address.Expires;
+                    document.getElementById('pp-cfg-cvv').value = r.address.CVV2;
+
+                    if (typeof GM_setValue !== 'undefined') {
+                        GM_setValue('pp_cardNumber', '');
+                        GM_setValue('pp_cardExpiry', '');
+                        GM_setValue('pp_cardCvv', '');
+                    }
+
+                    btnClearCard.innerText = '获取成功';
+                    log('获取卡号、有效期、CVV');
+                }).catch(e => {
+                    console.error('接口调用失败:', e);
+                });
+            });
+        }
+
         if (window.location.host.includes('chatgpt.com')) {
             // 显示功能按钮
             btnGetLink.style.setProperty('display', 'block', 'important');
@@ -895,6 +989,7 @@ var CONFIG = {
     }
 
     // 初始化UI并运行脚本
+    keepChatgptProfileConsoleButtonAlive();
     initUI();
     runScript();
 
