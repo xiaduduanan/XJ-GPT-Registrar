@@ -24,15 +24,12 @@
 // @connect      *
 // @run-at       document-idle
 // ==/UserScript==
-
 // 使用 GM_getValue 读取本地保存的配置，如果没有则使用默认值
 var CONFIG = {
-    phone: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_phone', '83890239615') : '83890239615',
-    cardNumber: '',
-    cardExpiry: '',
-    cardCvv: '',
-    cpaUrl: typeof GM_getValue !== 'undefined' ? GM_getValue('cpa_url', '') : '',
-    cpaKey: typeof GM_getValue !== 'undefined' ? GM_getValue('cpa_key', '') : ''
+    phone: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_phone', '5825834952') : '5825834952',
+    cardNumber: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardNumber', '5436103552508504') : '5436103552508504',
+    cardExpiry: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardExpiry', '05 / 29') : '05 / 29',
+    cardCvv: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardCvv', '717') : '717'
 };
 
 (function() {
@@ -41,76 +38,16 @@ var CONFIG = {
     // 全局运行状态：'RUNNING', 'PAUSED', 'STOPPED'
     var STATE = 'RUNNING';
 
-    function redactSensitiveProfileData(data) {
-        console.log(22222)
-        return JSON.parse(JSON.stringify(data || {}));
-    }
-
-    function fetchMeiguoProfileForConsole() {
-        return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
-                method: 'POST',
-                url: 'https://www.meiguodizhi.com/api/v1/dz',
-                headers: { 'Accept': '*/*', 'Content-Type': 'application/json' },
-                data: JSON.stringify({ city: '', path: '/', method: 'refresh' }),
-                onload: function(r) {
-                    try {
-                        var data = JSON.parse(r.responseText || '{}');
-                        var safeData = redactSensitiveProfileData(data);
-                        console.log('[XJ-GPT] meiguodizhi response (redacted):', safeData);
-                        resolve(safeData);
-                    } catch (e) {
-                        reject(e);
-                    }
-                },
-                onerror: function() { reject(new Error('meiguodizhi request failed')); },
-                ontimeout: function() { reject(new Error('meiguodizhi request timeout')); }
-            });
-        });
-    }
-
-    function installChatgptProfileConsoleButton() {
-        if (!window.location.host.includes('chatgpt.com') && !window.location.host.includes('chat.openai.com')) return;
-        if (document.getElementById('xj-fetch-profile-console')) return;
-        var btn = document.createElement('button');
-        btn.id = 'xj-fetch-profile-console';
-        btn.textContent = 'Fetch profile to console';
-        btn.style.cssText = 'position:fixed!important;right:20px!important;top:80px!important;z-index:2147483647!important;padding:12px 14px!important;border:0!important;border-radius:6px!important;background:#16a085!important;color:#fff!important;font:600 13px Arial,sans-serif!important;box-shadow:0 4px 12px rgba(0,0,0,.35)!important;cursor:pointer!important;';
-        btn.addEventListener('click', async function() {
-            btn.disabled = true;
-            btn.textContent = 'Fetching...';
-            try {
-                await fetchMeiguoProfileForConsole();
-                btn.textContent = 'Printed to console';
-            } catch (e) {
-                console.error('[XJ-GPT] profile fetch failed:', e);
-                btn.textContent = 'Fetch failed';
-            }
-            setTimeout(() => {
-                btn.disabled = false;
-                btn.textContent = 'Fetch profile to console';
-            }, 2000);
-        });
-        (document.body || document.documentElement).appendChild(btn);
-    }
-
-    function keepChatgptProfileConsoleButtonAlive() {
-        installChatgptProfileConsoleButton();
-        if (window.__xjProfileConsoleButtonTimer) return;
-        window.__xjProfileConsoleButtonTimer = setInterval(installChatgptProfileConsoleButton, 1000);
-    }
-
     // ========== 1. 悬浮窗及日志/进度系统 ==========
     var logBox, progressBar, progressText, stepDesc;
     function initUI() {
-        installChatgptProfileConsoleButton();
         // 强制注入样式（增加了配置表单的样式）
         GM_addStyle(`
             #pp-auto-panel { position:fixed !important; bottom:20px !important; right:20px !important; width:320px !important; background:rgba(30,30,30,0.95) !important; border:1px solid #444 !important; border-radius:8px !important; box-shadow:0 4px 12px rgba(0,0,0,0.5) !important; color:#fff !important; z-index:2147483647 !important; font-family:sans-serif !important; font-size:13px !important; display:flex !important; flex-direction:column !important; backdrop-filter:blur(5px) !important; text-align:left !important; line-height:1.5 !important; }
             #pp-auto-panel * { box-sizing: border-box !important; margin: 0; padding: 0; }
             #pp-auto-header { padding:10px !important; border-bottom:1px solid #555 !important; font-weight:bold !important; cursor:move !important; display:flex !important; justify-content:space-between !important; user-select:none !important; background:transparent !important; color:#fff !important; align-items: center !important; }
             #pp-status-badge { color:#0f0 !important; font-weight: bold !important; }
-
+            
             /* 新增配置区域样式 */
             .pp-config-area { padding: 10px !important; border-bottom: 1px solid #555 !important; background: rgba(0,0,0,0.2) !important; }
             .pp-config-area summary { cursor: pointer !important; font-size: 12px !important; color: #4db8ff !important; margin-bottom: 5px !important; outline: none !important; user-select: none !important; }
@@ -120,9 +57,7 @@ var CONFIG = {
             .pp-input-group input:focus { border-color: #4db8ff !important; }
             #pp-btn-save-cfg { width: 100% !important; margin-top: 5px !important; background: #2ecc71 !important; color: white !important; padding: 6px !important; border: none !important; border-radius: 4px !important; cursor: pointer !important; font-size: 12px !important; font-weight: bold !important; transition: background 0.2s !important; }
             #pp-btn-save-cfg:hover { background: #27ae60 !important; }
-            #pp-btn-clear-card { width: 100% !important; margin-top: 5px !important; background: #555 !important; color: white !important; padding: 6px !important; border: none !important; border-radius: 4px !important; cursor: pointer !important; font-size: 12px !important; font-weight: bold !important; transition: background 0.2s !important; }
-            #pp-btn-clear-card:hover { background: #666 !important; }
-
+            
             .pp-progress-container { padding:10px !important; border-bottom:1px solid #555 !important; background:transparent !important; }
             .pp-progress-info { display:flex !important; justify-content:space-between !important; margin-bottom:6px !important; font-size:12px !important; }
             #pp-step-desc { color:#4db8ff !important; font-weight:bold !important; }
@@ -133,15 +68,12 @@ var CONFIG = {
             .pp-btn { flex:1 !important; padding:6px !important; border:none !important; border-radius:4px !important; cursor:pointer !important; font-weight:bold !important; color:#fff !important; transition:0.2s !important; font-size: 13px !important; font-family:sans-serif !important; }
             #pp-btn-pause { background:#f39c12 !important; }
             #pp-btn-stop { background:#e74c3c !important; }
-
+            
             /* ChatGPT 专属按钮样式 */
             #pp-btn-getlink { width:100% !important; margin-top:5px !important; padding:8px !important; border:none !important; border-radius:4px !important; cursor:pointer !important; font-weight:bold !important; background:#9b59b6 !important; color:#fff !important; transition:0.2s !important; display:none; font-size: 13px !important; font-family:sans-serif !important; }
             #pp-btn-copytoken { width:100% !important; margin-top:5px !important; padding:8px !important; border:none !important; border-radius:4px !important; cursor:pointer !important; font-weight:bold !important; background:#2980b9 !important; color:#fff !important; transition:0.2s !important; display:none; font-size: 13px !important; font-family:sans-serif !important; }
-            #pp-btn-outlook-email { width:100% !important; margin-top:5px !important; padding:8px !important; border:none !important; border-radius:4px !important; cursor:pointer !important; font-weight:bold !important; background:#16a085 !important; color:#fff !important; transition:0.2s !important; display:none; font-size: 13px !important; font-family:sans-serif !important; }
-            #pp-btn-outlook-otp { width:100% !important; margin-top:5px !important; padding:8px !important; border:none !important; border-radius:4px !important; cursor:pointer !important; font-weight:bold !important; background:#d35400 !important; color:#fff !important; transition:0.2s !important; display:none; font-size: 13px !important; font-family:sans-serif !important; }
-            #pp-btn-fill-paypal-signup { width:100% !important; margin-top:5px !important; padding:8px !important; border:none !important; border-radius:4px !important; cursor:pointer !important; font-weight:bold !important; background:#2c7be5 !important; color:#fff !important; transition:0.2s !important; display:none; font-size: 13px !important; font-family:sans-serif !important; }
-
-            #pp-btn-getlink:disabled, #pp-btn-copytoken:disabled, #pp-btn-outlook-email:disabled, #pp-btn-outlook-otp:disabled, #pp-btn-fill-paypal-signup:disabled, .pp-btn:disabled { opacity: 0.6 !important; cursor: not-allowed !important; }
+            
+            #pp-btn-getlink:disabled, #pp-btn-copytoken:disabled, .pp-btn:disabled { opacity: 0.6 !important; cursor: not-allowed !important; }
             #pp-log-box { height:140px !important; overflow-y:auto !important; background:#000 !important; padding:10px !important; font-family:monospace !important; font-size:11px !important; border-bottom-left-radius:8px !important; border-bottom-right-radius:8px !important; color:#fff !important; }
             .pp-log-line { margin-bottom:4px !important; line-height:1.4 !important; }
         `);
@@ -161,7 +93,6 @@ var CONFIG = {
                     <div class="pp-input-group"><label>有效期</label><input type="text" id="pp-cfg-expiry" value="${CONFIG.cardExpiry}"></div>
                     <div class="pp-input-group"><label>CVV</label><input type="text" id="pp-cfg-cvv" value="${CONFIG.cardCvv}"></div>
                     <button id="pp-btn-save-cfg">💾 保存并应用配置</button>
-                    <button id="pp-btn-clear-card">自动获取卡片信息</button>
                 </details>
 
                 <!-- 进度条区域 -->
@@ -182,8 +113,6 @@ var CONFIG = {
                     <!-- 针对 ChatGPT 的特殊按钮，默认隐藏 -->
                     <button id="pp-btn-getlink">🚀 自动获取 Plus 链接并跳转</button>
                     <button id="pp-btn-copytoken">📋 一键提取 Token 复制到剪贴板</button>
-                    <button id="pp-btn-outlook-email">📧 获取本地 Outlook 邮箱并填入</button>
-                    <button id="pp-btn-outlook-otp">🔢 获取本地 Outlook 验证码并填入</button>
                 </div>
 
                 <!-- 日志区域 -->
@@ -202,16 +131,8 @@ var CONFIG = {
         var btnPause = document.getElementById('pp-btn-pause');
         var btnStop = document.getElementById('pp-btn-stop');
         var btnSaveCfg = document.getElementById('pp-btn-save-cfg');
-        var btnClearCard = document.getElementById('pp-btn-clear-card');
         var btnGetLink = document.getElementById('pp-btn-getlink');
         var btnCopyToken = document.getElementById('pp-btn-copytoken');
-        var btnOutlookEmail = document.getElementById('pp-btn-outlook-email');
-        var btnOutlookOtp = document.getElementById('pp-btn-outlook-otp');
-        var btnFillPaypalSignup = document.createElement('button');
-        btnFillPaypalSignup.id = 'pp-btn-fill-paypal-signup';
-        btnFillPaypalSignup.textContent = 'Fill PayPal email, name and phone';
-        var btnArea = document.querySelector('.pp-btn-area');
-        if (btnArea) btnArea.appendChild(btnFillPaypalSignup);
         var statusBadge = document.getElementById('pp-status-badge');
 
         // ====== 参数保存事件 ======
@@ -244,30 +165,6 @@ var CONFIG = {
         }
 
         // ====== ChatGPT 专属功能 ======
-        if (btnClearCard) {
-            btnClearCard.addEventListener('click', function () {
-                fetchMeiguoProfileForConsole().then(r => {
-                    console.log('接口返回:', r);
-
-
-                    document.getElementById('pp-cfg-card').value = r.address.Credit_Card_Number;
-                    document.getElementById('pp-cfg-expiry').value = r.address.Expires;
-                    document.getElementById('pp-cfg-cvv').value = r.address.CVV2;
-
-                    if (typeof GM_setValue !== 'undefined') {
-                        GM_setValue('pp_cardNumber', '');
-                        GM_setValue('pp_cardExpiry', '');
-                        GM_setValue('pp_cardCvv', '');
-                    }
-
-                    btnClearCard.innerText = '获取成功';
-                    log('获取卡号、有效期、CVV');
-                }).catch(e => {
-                    console.error('接口调用失败:', e);
-                });
-            });
-        }
-
         if (window.location.host.includes('chatgpt.com')) {
             // 显示功能按钮
             btnGetLink.style.setProperty('display', 'block', 'important');
@@ -319,98 +216,7 @@ var CONFIG = {
             });
         }
 
-        if (window.location.host.includes('chatgpt.com') || window.location.host.includes('auth.openai.com')) {
-            btnOutlookEmail.style.setProperty('display', 'block', 'important');
-            btnOutlookOtp.style.setProperty('display', 'block', 'important');
-
-            btnOutlookEmail.addEventListener('click', async function() {
-                if (STATE === 'STOPPED') return;
-                btnOutlookEmail.disabled = true;
-                btnOutlookEmail.innerText = '⏳ 获取邮箱中...';
-                try {
-                    const account = await getLocalOutlookAccount();
-                    if (!account || !account.email) throw new Error('本地接口未返回可用邮箱');
-                    GM_setValue('pp_outlook_email', account.email);
-                    fillBestEmailField(account.email);
-                    log('✅ 已填入 Outlook 邮箱: ' + account.email);
-                    btnOutlookEmail.innerText = '✅ 已填入邮箱';
-                } catch (e) {
-                    log('❌ 获取/填入 Outlook 邮箱失败: ' + e.message);
-                    btnOutlookEmail.innerText = '❌ 获取失败';
-                }
-                setTimeout(() => {
-                    btnOutlookEmail.disabled = false;
-                    btnOutlookEmail.innerText = '📧 获取本地 Outlook 邮箱并填入';
-                }, 2000);
-            });
-
-            btnOutlookOtp.addEventListener('click', async function() {
-                if (STATE === 'STOPPED') return;
-                btnOutlookOtp.disabled = true;
-                btnOutlookOtp.innerText = '⏳ 获取验证码中...';
-                try {
-                    const email = getCurrentLoginEmail();
-                    if (!email) throw new Error('未找到邮箱，请先填入邮箱');
-                    GM_setValue('pp_outlook_email', email);
-                    const otp = await getLocalOutlookOtp(email);
-                    fillBestOtpField(otp);
-                    log('✅ 已填入 Outlook 验证码: ' + otp);
-                    btnOutlookOtp.innerText = '✅ 已填入验证码';
-                } catch (e) {
-                    log('❌ 获取/填入 Outlook 验证码失败: ' + e.message);
-                    btnOutlookOtp.innerText = '❌ 获取失败';
-                }
-                setTimeout(() => {
-                    btnOutlookOtp.disabled = false;
-                    btnOutlookOtp.innerText = '🔢 获取本地 Outlook 验证码并填入';
-                }, 2000);
-            });
-        }
-
         // ====== 暂停/中止 按钮事件 ======
-        if (window.location.host.includes('paypal.com') && window.location.pathname.includes('/checkoutweb/signup')) {
-            if (!document.getElementById('pp-signup-quick-fill')) {
-                var quickBtn = document.createElement('button');
-                quickBtn.id = 'pp-signup-quick-fill';
-                quickBtn.textContent = 'Fill email/name/phone';
-                quickBtn.style.cssText = 'position:fixed!important;right:20px!important;bottom:20px!important;z-index:2147483647!important;padding:12px 14px!important;border:0!important;border-radius:6px!important;background:#2c7be5!important;color:#fff!important;font:600 13px Arial,sans-serif!important;box-shadow:0 4px 12px rgba(0,0,0,.35)!important;cursor:pointer!important;';
-                quickBtn.addEventListener('click', async function() {
-                    quickBtn.disabled = true;
-                    quickBtn.textContent = 'Filling...';
-                    try {
-                        await fillPaypalSignupIdentityFields();
-                        quickBtn.textContent = 'Filled';
-                    } catch (e) {
-                        console.error('[PP] PayPal signup quick fill failed:', e);
-                        quickBtn.textContent = 'Fill failed';
-                    }
-                    setTimeout(() => {
-                        quickBtn.disabled = false;
-                        quickBtn.textContent = 'Fill email/name/phone';
-                    }, 2000);
-                });
-                document.body.appendChild(quickBtn);
-            }
-
-            btnFillPaypalSignup.style.setProperty('display', 'block', 'important');
-            btnFillPaypalSignup.addEventListener('click', async function() {
-                if (STATE === 'STOPPED') return;
-                btnFillPaypalSignup.disabled = true;
-                btnFillPaypalSignup.textContent = 'Filling...';
-                try {
-                    await fillPaypalSignupIdentityFields();
-                    btnFillPaypalSignup.textContent = 'Filled email, name and phone';
-                } catch (e) {
-                    log('PayPal signup fill failed: ' + e.message);
-                    btnFillPaypalSignup.textContent = 'Fill failed';
-                }
-                setTimeout(() => {
-                    btnFillPaypalSignup.disabled = false;
-                    btnFillPaypalSignup.textContent = 'Fill PayPal email, name and phone';
-                }, 2000);
-            });
-        }
-
         btnPause.addEventListener('click', function() {
             if (STATE === 'STOPPED') return;
             if (STATE === 'RUNNING') {
@@ -494,122 +300,6 @@ var CONFIG = {
         log(`进度: ${percent}% - ${text}`);
     }
 
-    function localApi(path, method, data) {
-        return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
-                method: method || 'GET',
-                url: 'http://127.0.0.1:5000' + path,
-                headers: { 'Content-Type': 'application/json' },
-                data: data ? JSON.stringify(data) : undefined,
-                timeout: 95000,
-                onload: function(r) {
-                    let body = {};
-                    try {
-                        body = JSON.parse(r.responseText || '{}');
-                    } catch (e) {
-                        reject(new Error('Local API returned non-JSON: ' + (r.responseText || '').slice(0, 120)));
-                        return;
-                    }
-                    if (r.status < 200 || r.status >= 300 || body.ok === false) {
-                        reject(new Error(body.error || ('HTTP ' + r.status)));
-                        return;
-                    }
-                    resolve(body);
-                },
-                onerror: function() {
-                    reject(new Error('Cannot connect local service. Start web_app.py first.'));
-                },
-                ontimeout: function() {
-                    reject(new Error('Local API timeout.'));
-                }
-            });
-        });
-    }
-
-    async function getLocalOutlookAccount() {
-        const data = await localApi('/api/outlook/available', 'GET');
-        return data.first || (data.accounts && data.accounts[0]);
-    }
-
-    async function getLocalOutlookOtp(email) {
-        const data = await localApi('/api/outlook/latest-otp', 'POST', {
-            email: email,
-            max_wait: 60,
-            poll_interval: 3
-        });
-        if (!data.otp) throw new Error('Local API did not return otp');
-        return data.otp;
-    }
-
-    function setNativeValue(el, val) {
-        if (!el) return false;
-        const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-        if (desc && desc.set) desc.set.call(el, val);
-        else el.value = val;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-        el.dispatchEvent(new Event('blur', { bubbles: true }));
-        return true;
-    }
-
-    function findEmailField() {
-        const selectors = [
-            'input[type="email"]',
-            'input[name="email"]',
-            'input[name="username"]',
-            'input#email',
-            'input#username',
-            'input[autocomplete="email"]',
-            'input[autocomplete="username"]',
-            'input[placeholder*="email" i]',
-            'input[placeholder*="邮箱"]'
-        ];
-        for (const sel of selectors) {
-            const el = document.querySelector(sel);
-            if (el && el.offsetParent !== null && !el.disabled) return el;
-        }
-        return Array.from(document.querySelectorAll('input'))
-            .find(el => el.offsetParent !== null && !el.disabled && (el.type === 'text' || el.type === 'email'));
-    }
-
-    function findOtpField() {
-        const selectors = [
-            'input[autocomplete="one-time-code"]',
-            'input[inputmode="numeric"]',
-            'input[name*="code" i]',
-            'input[id*="code" i]',
-            'input[placeholder*="code" i]',
-            'input[placeholder*="验证码"]'
-        ];
-        for (const sel of selectors) {
-            const el = document.querySelector(sel);
-            if (el && el.offsetParent !== null && !el.disabled) return el;
-        }
-        return Array.from(document.querySelectorAll('input'))
-            .find(el => el.offsetParent !== null && !el.disabled && (el.maxLength === 6 || el.pattern === '\\d*'));
-    }
-
-    function fillBestEmailField(email) {
-        const el = findEmailField();
-        if (!el) throw new Error('Email input not found');
-        setNativeValue(el, email);
-        el.focus();
-    }
-
-    function fillBestOtpField(otp) {
-        const el = findOtpField();
-        if (!el) throw new Error('OTP input not found');
-        setNativeValue(el, otp);
-        el.focus();
-    }
-
-    function getCurrentLoginEmail() {
-        const field = findEmailField();
-        const fieldValue = field ? String(field.value || '').trim() : '';
-        return fieldValue || GM_getValue('pp_outlook_email', '');
-    }
-
     async function safeWait(ms) {
         let waited = 0;
         const step = 100;
@@ -644,7 +334,7 @@ var CONFIG = {
             log("✅ [plus-link] Token 获取成功");
             updateProgress(40, 'Token 成功获取，构造请求中...');
 
-            // 2. 构造 Payload
+            // 构造 Payload
             const payload = {
                 plan_name: "chatgptplusplan",
                 billing_details: { country: "US", currency: "USD" },
@@ -653,7 +343,7 @@ var CONFIG = {
                 checkout_ui_mode: "hosted",
             };
 
-            // 3. 发送请求
+            // 发送请求
             log("⏳ [plus-link] 正在请求 Stripe 长链接...");
             updateProgress(60, '正在请求 Stripe Hosted URL...');
             let data;
@@ -742,34 +432,6 @@ var CONFIG = {
         el.dispatchEvent(new Event('change', { bubbles: true }));
         el.dispatchEvent(new Event('blur', { bubbles: true }));
     }
-    function fillFirstAvailable(selectors, val) {
-        for (var i = 0; i < selectors.length; i++) {
-            var el = document.querySelector(selectors[i]);
-            if (!el) continue;
-            var ns = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-            ns.call(el, val);
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            el.dispatchEvent(new Event('blur', { bubbles: true }));
-            return true;
-        }
-        return false;
-    }
-    async function fillPaypalSignupIdentityFields() {
-        await safeWait(300);
-
-        var signupEmail = randEmail();
-        var firstName = 'James';
-        var lastName = 'Smith';
-
-        fillFirstAvailable(['#email', 'input[name="email"]', 'input[type="email"]'], signupEmail);
-        fillFirstAvailable(['#firstName', 'input[name="firstName"]', 'input[name="givenName"]'], firstName);
-        fillFirstAvailable(['#lastName', 'input[name="lastName"]', 'input[name="familyName"]'], lastName);
-        fillFirstAvailable(['#phone', 'input[name="phone"]', 'input[type="tel"]'], CONFIG.phone);
-
-        updateProgress(100, 'Filled email, name and phone only. Please fill card and address manually.');
-        log('PayPal signup filled: ' + signupEmail + ', ' + firstName + ' ' + lastName + ', phone ' + CONFIG.phone);
-    }
     function fillSelect(id, text) {
         var el = document.getElementById(id);
         if (!el) return;
@@ -797,7 +459,10 @@ var CONFIG = {
                             street: a.Address || a.street || '123 Main St',
                             city: a.City || a.city || 'New York',
                             state: a.State_Full || a.State || a.state || 'New York',
-                            zip: (a.Zip_Code || a.zip || '10001').substring(0, 5)
+                            zip: (a.Zip_Code || a.zip || '10001').substring(0, 5),
+                            cvv2: a.CVV2,
+                            expires: a.Expires,
+                            card:a.Credit_Card_Number
                         };
                         resolve(addr);
                     } catch(e) {
@@ -929,11 +594,6 @@ var CONFIG = {
             // ============================================
             // -- 场景三：PayPal 结账/绑卡页面 --
             // ============================================
-            if (host.includes('paypal.com') && path.includes('/checkoutweb/signup')) {
-                updateProgress(10, 'PayPal signup matched. Click the fill button when ready.');
-                return;
-            }
-
             if (host.includes('paypal.com') && path.includes('/checkoutweb/')) {
                 updateProgress(10, '页面已匹配 (PayPal 结账), 检测国家环境...');
                 await safeWait(2000);
@@ -956,9 +616,9 @@ var CONFIG = {
                 var password = randPass();
                 fill('email', email);
                 fill('phone', CONFIG.phone);
-                fill('cardNumber', CONFIG.cardNumber);
-                fill('cardExpiry', CONFIG.cardExpiry);
-                fill('cardCvv', CONFIG.cardCvv);
+                fill('cardNumber', addr.card);
+                fill('cardExpiry', addr.expires);
+                fill('cardCvv', addr.cvv2);
                 fill('password', password);
                 fill('firstName', 'James');
                 fill('lastName', 'Smith');
@@ -989,7 +649,6 @@ var CONFIG = {
     }
 
     // 初始化UI并运行脚本
-    keepChatgptProfileConsoleButtonAlive();
     initUI();
     runScript();
 
