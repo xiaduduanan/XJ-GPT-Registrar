@@ -18,6 +18,7 @@
 // @grant        GM_setClipboard
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        unsafeWindow
 // @connect      meiguodizhi.com
 // @connect      127.0.0.1
 // @connect      localhost
@@ -29,7 +30,9 @@ var CONFIG = {
     phone: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_phone', '5825834952') : '5825834952',
     cardNumber: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardNumber', '5436103552508504') : '5436103552508504',
     cardExpiry: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardExpiry', '05 / 29') : '05 / 29',
-    cardCvv: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardCvv', '717') : '717'
+    cardCvv: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardCvv', '717') : '717',
+    chatGptLoginEmail: 'xdudduanan@outlook.com',
+    chatGptEmailVerificationCode: '445462'
 };
 
 (function() {
@@ -72,8 +75,9 @@ var CONFIG = {
             /* ChatGPT 专属按钮样式 */
             #pp-btn-getlink { width:100% !important; margin-top:5px !important; padding:8px !important; border:none !important; border-radius:4px !important; cursor:pointer !important; font-weight:bold !important; background:#9b59b6 !important; color:#fff !important; transition:0.2s !important; display:none; font-size: 13px !important; font-family:sans-serif !important; }
             #pp-btn-copytoken { width:100% !important; margin-top:5px !important; padding:8px !important; border:none !important; border-radius:4px !important; cursor:pointer !important; font-weight:bold !important; background:#2980b9 !important; color:#fff !important; transition:0.2s !important; display:none; font-size: 13px !important; font-family:sans-serif !important; }
-            
-            #pp-btn-getlink:disabled, #pp-btn-copytoken:disabled, .pp-btn:disabled { opacity: 0.6 !important; cursor: not-allowed !important; }
+            #pp-btn-login { width:100% !important; margin-top:5px !important; padding:8px !important; border:none !important; border-radius:4px !important; cursor:pointer !important; font-weight:bold !important; background:#10a37f !important; color:#fff !important; transition:0.2s !important; display:none; font-size: 13px !important; font-family:sans-serif !important; }
+
+            #pp-btn-login:disabled, #pp-btn-getlink:disabled, #pp-btn-copytoken:disabled, .pp-btn:disabled { opacity: 0.6 !important; cursor: not-allowed !important; }
             #pp-log-box { height:140px !important; overflow-y:auto !important; background:#000 !important; padding:10px !important; font-family:monospace !important; font-size:11px !important; border-bottom-left-radius:8px !important; border-bottom-right-radius:8px !important; color:#fff !important; }
             .pp-log-line { margin-bottom:4px !important; line-height:1.4 !important; }
         `);
@@ -111,6 +115,7 @@ var CONFIG = {
                     <button id="pp-btn-pause" class="pp-btn">暂停</button>
                     <button id="pp-btn-stop" class="pp-btn">中止打断</button>
                     <!-- 针对 ChatGPT 的特殊按钮，默认隐藏 -->
+                    <button id="pp-btn-login">🔐 跳转 ChatGPT 登录页</button>
                     <button id="pp-btn-getlink">🚀 自动获取 Plus 链接并跳转</button>
                     <button id="pp-btn-copytoken">📋 一键提取 Token 复制到剪贴板</button>
                 </div>
@@ -131,6 +136,7 @@ var CONFIG = {
         var btnPause = document.getElementById('pp-btn-pause');
         var btnStop = document.getElementById('pp-btn-stop');
         var btnSaveCfg = document.getElementById('pp-btn-save-cfg');
+        var btnLogin = document.getElementById('pp-btn-login');
         var btnGetLink = document.getElementById('pp-btn-getlink');
         var btnCopyToken = document.getElementById('pp-btn-copytoken');
         var statusBadge = document.getElementById('pp-status-badge');
@@ -167,8 +173,16 @@ var CONFIG = {
         // ====== ChatGPT 专属功能 ======
         if (window.location.host.includes('chatgpt.com')) {
             // 显示功能按钮
+            btnLogin.style.setProperty('display', 'block', 'important');
             btnGetLink.style.setProperty('display', 'block', 'important');
             btnCopyToken.style.setProperty('display', 'block', 'important');
+
+            btnLogin.addEventListener('click', function() {
+                if (STATE === 'STOPPED') return;
+                log('🔐 正在跳转 ChatGPT 登录页...');
+                updateProgress(100, '正在跳转 ChatGPT 登录页...');
+                window.location.href = 'https://chatgpt.com/auth/login';
+            });
 
             // 绑定长链接跳转事件
             btnGetLink.addEventListener('click', async function() {
@@ -314,6 +328,145 @@ var CONFIG = {
         }
     }
 
+    let chatGptLoginClicked = false;
+
+    function findVisibleChatGptLoginButton() {
+        const buttons = Array.from(document.querySelectorAll('button[data-testid="login-button"]'));
+        for (const btn of buttons) {
+            const rect = btn.getBoundingClientRect();
+            if (btn.disabled || rect.width <= 0 || rect.height <= 0) continue;
+            const cx = rect.left + rect.width / 2;
+            const cy = rect.top + rect.height / 2;
+            const topEl = document.elementFromPoint(cx, cy);
+            if (topEl && (topEl === btn || btn.contains(topEl))) return btn;
+        }
+        return null;
+    }
+
+    function dispatchMouseLikeEvent(target, type, x, y) {
+        const eventInit = {
+            bubbles: true,
+            cancelable: true,
+            clientX: x,
+            clientY: y,
+            button: 0,
+            buttons: type === 'mouseup' || type === 'click' ? 0 : 1,
+        };
+        let event;
+        if (type.startsWith('pointer') && typeof PointerEvent !== 'undefined') {
+            event = new PointerEvent(type, {
+                ...eventInit,
+                pointerId: 1,
+                pointerType: 'mouse',
+                isPrimary: true,
+            });
+        } else {
+            event = new MouseEvent(type, eventInit);
+        }
+        target.dispatchEvent(event);
+    }
+
+    function robustClickElement(el) {
+        el.scrollIntoView({ block: 'center', inline: 'center' });
+        el.focus({ preventScroll: true });
+        const rect = el.getBoundingClientRect();
+        const x = rect.left + rect.width / 2;
+        const y = rect.top + rect.height / 2;
+        const target = document.elementFromPoint(x, y) || el;
+
+        dispatchMouseLikeEvent(target, 'pointerover', x, y);
+        dispatchMouseLikeEvent(target, 'pointerenter', x, y);
+        dispatchMouseLikeEvent(target, 'mouseover', x, y);
+        dispatchMouseLikeEvent(target, 'mouseenter', x, y);
+        dispatchMouseLikeEvent(target, 'pointerdown', x, y);
+        dispatchMouseLikeEvent(target, 'mousedown', x, y);
+        dispatchMouseLikeEvent(target, 'pointerup', x, y);
+        dispatchMouseLikeEvent(target, 'mouseup', x, y);
+        dispatchMouseLikeEvent(target, 'click', x, y);
+        el.click();
+    }
+
+    function isChatGptLoginFlowStarted(beforeHref) {
+        if (window.location.href !== beforeHref) return true;
+        if (document.querySelector('input[type="email"], input[name="email"], input#email')) return true;
+        if (document.querySelector('[role="dialog"] input[type="email"], [data-testid*="login"] input')) return true;
+        return false;
+    }
+
+    function fallbackToChatGptLogin(beforeHref) {
+        if (STATE === 'STOPPED' || isChatGptLoginFlowStarted(beforeHref)) return;
+
+        const loginLink = document.querySelector(
+            'a[href*="/auth/login"], a[href*="auth.openai.com"], a[href*="/log-in"], a[href*="/login"]'
+        );
+        if (loginLink && loginLink.href) {
+            log('ChatGPT 登录按钮点击无页面变化，改为跳转登录链接: ' + loginLink.href);
+            window.location.assign(loginLink.href);
+            return;
+        }
+
+        log('ChatGPT 登录按钮点击无页面变化，改为跳转 /auth/login');
+        window.location.assign('https://chatgpt.com/auth/login');
+    }
+
+    async function autoClickChatGptLoginButton() {
+        if (chatGptLoginClicked || STATE === 'STOPPED') return;
+
+        const clickIfReady = () => {
+            if (chatGptLoginClicked || STATE === 'STOPPED') return true;
+            const btn = findVisibleChatGptLoginButton();
+            if (!btn) return false;
+            chatGptLoginClicked = true;
+            const beforeHref = window.location.href;
+            robustClickElement(btn);
+            setTimeout(() => fallbackToChatGptLogin(beforeHref), 1200);
+            updateProgress(100, '已自动点击登录按钮，请手动输入账号密码');
+            log('✅ 已自动点击 ChatGPT 登录按钮');
+            return true;
+        };
+
+        if (clickIfReady()) return;
+        updateProgress(15, '正在等待 ChatGPT 登录按钮渲染...');
+
+        await new Promise((resolve) => {
+            const timeoutMs = 15000;
+            let done = false;
+
+            const finish = (message) => {
+                if (done) return;
+                done = true;
+                observer.disconnect();
+                clearInterval(intervalId);
+                clearTimeout(timeoutId);
+                if (message) log(message);
+                resolve();
+            };
+
+            const observer = new MutationObserver(() => {
+                if (clickIfReady()) finish();
+            });
+
+            observer.observe(document.documentElement || document.body, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+            });
+
+            const intervalId = setInterval(() => {
+                if (STATE === 'STOPPED') {
+                    finish('ChatGPT 登录按钮等待已中止');
+                    return;
+                }
+                if (clickIfReady()) finish();
+            }, 500);
+
+            const timeoutId = setTimeout(() => {
+                updateProgress(10, '未找到登录按钮，可能已登录或页面结构变化');
+                finish('未找到 ChatGPT 登录按钮，可能已登录或页面结构变化');
+            }, timeoutMs);
+        });
+    }
+
     // ========== API 生成跳转长链接逻辑 ==========
     async function generatePlusHostedLink() {
         try {
@@ -444,6 +597,311 @@ var CONFIG = {
         }
     }
 
+    function getVisibleChatGptEmailInput() {
+        var inputs = Array.from(document.querySelectorAll('input#email, input[name="email"], input[type="email"]'));
+        return inputs.find(function(input) {
+            var rect = input.getBoundingClientRect();
+            return !input.disabled && rect.width > 0 && rect.height > 0;
+        }) || null;
+    }
+
+    function findChatGptContinueButton() {
+        var emailInput = getVisibleChatGptEmailInput();
+        var form = emailInput ? emailInput.closest('form') : null;
+        var btn = form ? form.querySelector('button[type="submit"]') : null;
+        if (!btn && form) btn = form.querySelector('button');
+
+        if (!btn) {
+            btn = document.querySelector('form input#email, form input[name="email"], form input[type="email"]')
+                ?.closest('form')
+                ?.querySelector('button[type="submit"], button');
+        }
+
+        if (!btn) return null;
+        var rect = btn.getBoundingClientRect();
+        if (btn.disabled || rect.width <= 0 || rect.height <= 0) return null;
+        return btn;
+    }
+
+    function fillChatGptEmailInput(emailInput) {
+        emailInput.scrollIntoView({ block: 'center', inline: 'center' });
+        emailInput.focus();
+        emailInput.click();
+        var inputWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : (emailInput.ownerDocument && emailInput.ownerDocument.defaultView ? emailInput.ownerDocument.defaultView : window);
+        var ns = Object.getOwnPropertyDescriptor(inputWindow.HTMLInputElement.prototype, 'value').set;
+        ns.call(emailInput, CONFIG.chatGptLoginEmail);
+        emailInput.setAttribute('value', CONFIG.chatGptLoginEmail);
+        emailInput.dispatchEvent(new inputWindow.InputEvent('beforeinput', {
+            bubbles: true,
+            cancelable: true,
+            inputType: 'insertText',
+            data: CONFIG.chatGptLoginEmail,
+        }));
+        emailInput.dispatchEvent(new inputWindow.InputEvent('input', {
+            bubbles: true,
+            cancelable: true,
+            inputType: 'insertText',
+            data: CONFIG.chatGptLoginEmail,
+        }));
+        emailInput.dispatchEvent(new inputWindow.Event('change', { bubbles: true }));
+    }
+
+    async function autoFillChatGptLoginEmail() {
+        var maxWait = 15000;
+        var waited = 0;
+        var step = 300;
+        var emailFilled = false;
+
+        while (waited < maxWait) {
+            if (STATE === 'STOPPED') return false;
+
+            var emailInput = getVisibleChatGptEmailInput();
+
+            if (emailInput && (!emailFilled || emailInput.value !== CONFIG.chatGptLoginEmail)) {
+                fillChatGptEmailInput(emailInput);
+                emailFilled = emailInput.value === CONFIG.chatGptLoginEmail;
+                updateProgress(45, '已填写 ChatGPT 邮箱，等待继续按钮...');
+                log('✅ 已填写 ChatGPT 邮箱: ' + CONFIG.chatGptLoginEmail + '，当前输入框值: ' + emailInput.value);
+            }
+
+            var continueBtn = findChatGptContinueButton();
+            if (emailInput && emailInput.value === CONFIG.chatGptLoginEmail && continueBtn) {
+                await safeWait(800);
+                if (emailInput.value !== CONFIG.chatGptLoginEmail) {
+                    emailFilled = false;
+                    continue;
+                }
+                robustClickElement(continueBtn);
+                updateProgress(100, '已填写 ChatGPT 邮箱并点击继续');
+                log('✅ 已点击邮箱表单的继续按钮');
+                return true;
+            }
+
+            await safeWait(step);
+            waited += step;
+        }
+
+        updateProgress(10, '未找到 ChatGPT 邮箱输入框或继续按钮');
+        log('未找到 ChatGPT 邮箱输入框或继续按钮');
+        return false;
+    }
+
+    function setElementTextLikeInput(el, value) {
+        if (!el) return false;
+        el.scrollIntoView({ block: 'center', inline: 'center' });
+        el.click();
+        var elWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : (el.ownerDocument && el.ownerDocument.defaultView ? el.ownerDocument.defaultView : window);
+
+        if (!('value' in el)) {
+            try {
+                el.focus();
+                elWindow.document.execCommand('selectAll', false, null);
+                elWindow.document.execCommand('insertText', false, value);
+            } catch (e) {}
+
+            for (var i = 0; i < value.length; i++) {
+                var ch = value[i];
+                el.dispatchEvent(new elWindow.KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: ch, code: 'Digit' + ch }));
+                el.dispatchEvent(new elWindow.KeyboardEvent('keypress', { bubbles: true, cancelable: true, key: ch, code: 'Digit' + ch }));
+                el.dispatchEvent(new elWindow.InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: ch }));
+                el.dispatchEvent(new elWindow.InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: ch }));
+                el.dispatchEvent(new elWindow.KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: ch, code: 'Digit' + ch }));
+            }
+            el.dispatchEvent(new elWindow.Event('change', { bubbles: true }));
+            return true;
+        }
+
+        el.focus();
+        if ('value' in el) {
+            var proto = el instanceof HTMLTextAreaElement ? elWindow.HTMLTextAreaElement.prototype : elWindow.HTMLInputElement.prototype;
+            var setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+            var lastValue = el.value;
+            if (setter) setter.call(el, '');
+            else el.value = '';
+            if (el._valueTracker) el._valueTracker.setValue(lastValue);
+            el.dispatchEvent(new elWindow.Event('input', { bubbles: true }));
+
+            for (var j = 0; j < value.length; j++) {
+                var nextValue = value.slice(0, j + 1);
+                var ch2 = value[j];
+                el.dispatchEvent(new elWindow.KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: ch2, code: 'Digit' + ch2 }));
+                el.dispatchEvent(new elWindow.InputEvent('beforeinput', {
+                    bubbles: true,
+                    cancelable: true,
+                    inputType: 'insertText',
+                    data: ch2,
+                }));
+                lastValue = el.value;
+                if (setter) setter.call(el, nextValue);
+                else el.value = nextValue;
+                if (el._valueTracker) el._valueTracker.setValue(lastValue);
+                el.dispatchEvent(new elWindow.InputEvent('input', {
+                    bubbles: true,
+                    cancelable: true,
+                    inputType: 'insertText',
+                    data: ch2,
+                }));
+                el.dispatchEvent(new elWindow.KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: ch2, code: 'Digit' + ch2 }));
+            }
+            el.dispatchEvent(new elWindow.Event('change', { bubbles: true }));
+            return el.value === value;
+        }
+
+        try {
+            el.dispatchEvent(new elWindow.InputEvent('beforeinput', {
+                bubbles: true,
+                cancelable: true,
+                inputType: 'insertText',
+                data: value,
+            }));
+            el.dispatchEvent(new elWindow.InputEvent('input', {
+                bubbles: true,
+                cancelable: true,
+                inputType: 'insertText',
+                data: value,
+            }));
+        } catch (e) {
+            el.dispatchEvent(new elWindow.Event('input', { bubbles: true }));
+        }
+        el.dispatchEvent(new elWindow.Event('change', { bubbles: true }));
+        return true;
+    }
+
+    function forceFillOtpInput(input, code) {
+        if (!input) return false;
+        var pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : (input.ownerDocument && input.ownerDocument.defaultView ? input.ownerDocument.defaultView : window);
+        var setter = Object.getOwnPropertyDescriptor(pageWindow.HTMLInputElement.prototype, 'value')?.set;
+
+        input.scrollIntoView({ block: 'center', inline: 'center' });
+        input.focus();
+        input.click();
+
+        var oldValue = input.value;
+        if (setter) setter.call(input, '');
+        else input.value = '';
+        input.setAttribute('value', '');
+        if (input._valueTracker) input._valueTracker.setValue(oldValue);
+        input.dispatchEvent(new pageWindow.Event('input', { bubbles: true }));
+
+        for (var i = 0; i < code.length; i++) {
+            var ch = code[i];
+            var next = code.slice(0, i + 1);
+            input.dispatchEvent(new pageWindow.KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: ch, code: 'Digit' + ch }));
+            input.dispatchEvent(new pageWindow.InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: ch }));
+            oldValue = input.value;
+            if (setter) setter.call(input, next);
+            else input.value = next;
+            input.setAttribute('value', next);
+            if (input._valueTracker) input._valueTracker.setValue(oldValue);
+            input.dispatchEvent(new pageWindow.InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: ch }));
+            input.dispatchEvent(new pageWindow.KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: ch, code: 'Digit' + ch }));
+        }
+
+        input.dispatchEvent(new pageWindow.Event('change', { bubbles: true }));
+        input.blur();
+        input.focus();
+        log('验证码 input 当前 value=' + input.value + ', attr=' + input.getAttribute('value'));
+        return input.value === code;
+    }
+
+    function findEmailVerificationCodeInput() {
+        var inputs = Array.from(document.querySelectorAll(
+            'input#_r_5_-code, input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]'
+        ));
+        return inputs.find(function(el) {
+            var rect = el.getBoundingClientRect();
+            return !el.disabled && rect.width > 0 && rect.height > 0;
+        }) || null;
+    }
+
+    function getCurrentOtpValue() {
+        var primary = findEmailVerificationCodeInput();
+        if (primary && primary.value) return primary.value.replace(/\D/g, '');
+        return '';
+    }
+
+    function findEmailVerificationCodeTarget() {
+        var primary = findEmailVerificationCodeInput();
+        if (primary) return primary;
+        return null;
+    }
+
+    function fillSplitOtpInputs(code) {
+        var primary = findEmailVerificationCodeInput();
+        if (primary) {
+            return forceFillOtpInput(primary, code);
+        }
+        log('未找到真实验证码 input[name="code"]，不会填 div 兜底');
+        return false;
+    }
+
+    function findEmailVerificationSubmitButton() {
+        var codeInput = findEmailVerificationCodeInput();
+        var form = null;
+        if (codeInput) {
+            var formId = codeInput.getAttribute('form');
+            form = formId ? document.getElementById(formId) : codeInput.closest('form');
+        }
+        var formButton = form ? form.querySelector('button[type="submit"], button') : null;
+        if (formButton) return formButton;
+
+        var buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
+        return buttons.find(function(btn) {
+            var text = (btn.textContent || '').trim();
+            var rect = btn.getBoundingClientRect();
+            return !btn.disabled && rect.width > 0 && rect.height > 0 && (
+                text.includes('继续') ||
+                text.toLowerCase().includes('continue') ||
+                text.includes('验证') ||
+                text.toLowerCase().includes('verify')
+            );
+        }) || null;
+    }
+
+    async function autoFillEmailVerificationCode() {
+        var maxWait = 15000;
+        var waited = 0;
+        var step = 300;
+        var code = CONFIG.chatGptEmailVerificationCode;
+        var codeFilled = false;
+
+        while (waited < maxWait) {
+            if (STATE === 'STOPPED') return false;
+
+            if (!codeFilled) {
+                codeFilled = fillSplitOtpInputs(code);
+                if (!codeFilled) {
+                    var target = findEmailVerificationCodeTarget();
+                    if (target) codeFilled = setElementTextLikeInput(target, code);
+                }
+                if (codeFilled) {
+                    updateProgress(65, '已填写邮箱验证码，等待确认按钮...');
+                    log('✅ 已填写邮箱验证码: ' + code + '，当前页面值: ' + getCurrentOtpValue());
+                }
+            }
+
+            var btn = findEmailVerificationSubmitButton();
+            if (codeFilled && btn && getCurrentOtpValue().endsWith(code)) {
+                await safeWait(800);
+                if (!getCurrentOtpValue().endsWith(code)) {
+                    codeFilled = false;
+                    continue;
+                }
+                robustClickElement(btn);
+                updateProgress(100, '已填写验证码并点击确认按钮');
+                log('✅ 已点击邮箱验证码确认按钮');
+                return true;
+            }
+
+            await safeWait(step);
+            waited += step;
+        }
+
+        updateProgress(10, '未找到邮箱验证码输入区域或确认按钮');
+        log('未找到邮箱验证码输入区域或确认按钮');
+        return false;
+    }
+
     function getAddrAsync() {
         return new Promise((resolve) => {
             GM_xmlhttpRequest({
@@ -524,8 +982,18 @@ var CONFIG = {
             // ============================================
             // -- 场景〇：ChatGPT主站 (等待点击按钮获取链接) --
             // ============================================
-            if (host.includes('chatgpt.com')) {
-                updateProgress(10, '已就绪，请点击面板按键进行操作...');
+            if (host.includes('chatgpt.com') || host.includes('auth.openai.com')) {
+                if (host.includes('auth.openai.com') && path.includes('/email-verification')) {
+                    updateProgress(10, '正在等待邮箱验证码输入区域...');
+                    await autoFillEmailVerificationCode();
+                    return;
+                }
+                if (document.querySelector('input#email, input[name="email"], input[type="email"]') || path.includes('/auth/login') || path.includes('/log-in')) {
+                    updateProgress(10, '正在等待 ChatGPT 邮箱输入框...');
+                    await autoFillChatGptLoginEmail();
+                    return;
+                }
+                updateProgress(10, '已就绪，可点击“跳转 ChatGPT 登录页”');
                 return;
             }
 
