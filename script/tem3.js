@@ -487,6 +487,77 @@ var CONFIG = {
         return await claimOutlookAccount();
     }
 
+    function stripHtmlForOtp(text) {
+        var raw = String(text || '');
+        if (!raw) return '';
+        return raw
+            .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+            .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/&nbsp;/gi, ' ')
+            .replace(/&amp;/gi, '&')
+            .replace(/&lt;/gi, '<')
+            .replace(/&gt;/gi, '>')
+            .replace(/&#(\d+);/g, function(_, n) { return String.fromCharCode(parseInt(n, 10)); })
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function extractSixDigitOtpFromText(text) {
+        var normalized = stripHtmlForOtp(text);
+        if (!normalized) return '';
+
+        var keywords = ['验证码', '临时', 'temporary', 'verification', 'verify', 'code', 'otp'];
+        var lower = normalized.toLowerCase();
+        for (var i = 0; i < keywords.length; i++) {
+            var keyword = keywords[i].toLowerCase();
+            var pos = lower.indexOf(keyword);
+            while (pos !== -1) {
+                var start = Math.max(0, pos - 80);
+                var end = Math.min(normalized.length, pos + keyword.length + 160);
+                var nearby = normalized.slice(start, end).match(/\b\d{6}\b/);
+                if (nearby) return nearby[0];
+                pos = lower.indexOf(keyword, pos + keyword.length);
+            }
+        }
+
+        var first = normalized.match(/\b\d{6}\b/);
+        return first ? first[0] : '';
+    }
+
+    async function fetchOutlookOtpFromLatestMessage(email) {
+        var latestData = await externalApiJson('GET', '/api/external/messages/latest', {
+            email: email,
+            folder: 'inbox',
+            since_minutes: 1440,
+        }, 20000);
+        var latest = latestData && (latestData.data || latestData);
+        var messageId = latest && latest.id;
+        if (!messageId) {
+            throw new Error('latest message did not include id');
+        }
+
+        var detailData = await externalApiJson('GET', '/api/external/messages/' + encodeURIComponent(String(messageId)), {
+            email: email,
+            folder: 'inbox',
+        }, 20000);
+        var detail = detailData && (detailData.data || detailData);
+        var sourceText = [
+            detail && detail.subject,
+            detail && detail.content,
+            detail && detail.html_content,
+            detail && detail.raw_content,
+            latest && latest.subject,
+            latest && latest.content_preview,
+        ].filter(Boolean).join(' ');
+        var otp = extractSixDigitOtpFromText(sourceText);
+        if (!otp) {
+            throw new Error('messages detail fallback found no 6-digit otp');
+        }
+        log('Outlook OTP source: messages detail fallback, message_id=' + messageId);
+        return otp;
+    }
+
     async function fetchOutlookOtp(email) {
         if (!CONFIG.outlookPlusApiKey) {
             throw new Error('Missing pp_outlook_plus_api_key');
@@ -512,10 +583,19 @@ var CONFIG = {
                 var result = data && (data.data || data);
                 var otp = result && (result.verification_code || result.otp || result.code || result.formatted);
                 otp = String(otp || '').replace(/\D/g, '');
-                if (otp) return otp;
+                if (otp) {
+                    log('Outlook OTP source: verification-code');
+                    return otp;
+                }
                 lastError = 'empty otp';
             } catch (e) {
                 lastError = e.message;
+            }
+
+            try {
+                return await fetchOutlookOtpFromLatestMessage(email);
+            } catch (fallbackError) {
+                lastError = lastError ? (lastError + '; fallback: ' + fallbackError.message) : fallbackError.message;
             }
 
             await safeWait(pollInterval * 1000);
