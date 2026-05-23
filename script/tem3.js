@@ -31,8 +31,10 @@ var CONFIG = {
     cardNumber: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardNumber', '5436103552508504') : '5436103552508504',
     cardExpiry: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardExpiry', '05 / 29') : '05 / 29',
     cardCvv: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardCvv', '717') : '717',
-    chatGptLoginEmail: 'xdudduanan@outlook.com',
-    chatGptEmailVerificationCode: '445462'
+    localApiBase: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_local_api_base', 'http://127.0.0.1:5001') : 'http://127.0.0.1:5001',
+    outlookPlusApiKey: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_outlook_plus_api_key', 'hoI7kOgnDRlwdhBXxYjhrk2LAFdszhtZp-cquoXWKFGsr-0rJNnChEb3bAqAU5rz') : 'hoI7kOgnDRlwdhBXxYjhrk2LAFdszhtZp-cquoXWKFGsr-0rJNnChEb3bAqAU5rz',
+    chatGptLoginEmail: '',
+    chatGptEmailVerificationCode: ''
 };
 
 (function() {
@@ -40,6 +42,7 @@ var CONFIG = {
 
     // 全局运行状态：'RUNNING', 'PAUSED', 'STOPPED'
     var STATE = 'RUNNING';
+    var currentOutlookAccount = null;
 
     // ========== 1. 悬浮窗及日志/进度系统 ==========
     var logBox, progressBar, progressText, stepDesc;
@@ -177,8 +180,19 @@ var CONFIG = {
             btnGetLink.style.setProperty('display', 'block', 'important');
             btnCopyToken.style.setProperty('display', 'block', 'important');
 
-            btnLogin.addEventListener('click', function() {
+            btnLogin.addEventListener('click', async function() {
                 if (STATE === 'STOPPED') return;
+                btnLogin.disabled = true;
+                try {
+                    updateProgress(20, 'Claiming Outlook account...');
+                    var account = await claimOutlookAccount();
+                    log('Using Outlook account: ' + account.email);
+                } catch (e) {
+                    btnLogin.disabled = false;
+                    updateProgress(0, '领取 Outlook 邮箱失败，请检查本地服务/号池');
+                    log('领取 Outlook 邮箱失败，请检查本地服务/号池: ' + e.message);
+                    return;
+                }
                 log('🔐 正在跳转 ChatGPT 登录页...');
                 updateProgress(100, '正在跳转 ChatGPT 登录页...');
                 window.location.href = 'https://chatgpt.com/auth/login';
@@ -326,6 +340,189 @@ var CONFIG = {
             await new Promise(r => setTimeout(r, step));
             waited += step;
         }
+    }
+
+    function normalizeLocalApiBase() {
+        return String(CONFIG.localApiBase || 'http://127.0.0.1:5001').replace(/\/+$/, '');
+    }
+
+    function parseStoredOutlookAccount(raw) {
+        if (!raw) return null;
+        try {
+            var account = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            if (account && account.email) {
+                return {
+                    id: account.id || account.account_id || null,
+                    account_id: account.account_id || account.id || null,
+                    email: String(account.email),
+                    claim_token: account.claim_token || '',
+                    caller_id: account.caller_id || '',
+                    task_id: account.task_id || '',
+                };
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    function loadCurrentOutlookAccount() {
+        if (currentOutlookAccount && currentOutlookAccount.email) return currentOutlookAccount;
+        if (typeof GM_getValue === 'undefined') return null;
+        currentOutlookAccount = parseStoredOutlookAccount(GM_getValue('pp_current_outlook_account', null));
+        return currentOutlookAccount;
+    }
+
+    function saveCurrentOutlookAccount(account) {
+        currentOutlookAccount = {
+            id: account.id || account.account_id || null,
+            account_id: account.account_id || account.id || null,
+            email: String(account.email),
+            claim_token: account.claim_token || '',
+            caller_id: account.caller_id || '',
+            task_id: account.task_id || '',
+        };
+        if (typeof GM_setValue !== 'undefined') {
+            GM_setValue('pp_current_outlook_account', JSON.stringify(currentOutlookAccount));
+        }
+        return currentOutlookAccount;
+    }
+
+    function clearCurrentOutlookAccount() {
+        currentOutlookAccount = null;
+        if (typeof GM_setValue !== 'undefined') {
+            GM_setValue('pp_current_outlook_account', '');
+        }
+    }
+
+    function buildQuery(params) {
+        var pairs = [];
+        Object.keys(params || {}).forEach(function(key) {
+            var value = params[key];
+            if (value === undefined || value === null || value === '') return;
+            pairs.push(encodeURIComponent(key) + '=' + encodeURIComponent(String(value)));
+        });
+        return pairs.length ? '?' + pairs.join('&') : '';
+    }
+
+    function externalApiJson(method, path, payload, timeoutMs) {
+        return new Promise((resolve, reject) => {
+            if (typeof GM_xmlhttpRequest === 'undefined') {
+                reject(new Error('GM_xmlhttpRequest is unavailable'));
+                return;
+            }
+
+            var httpMethod = String(method || 'GET').toUpperCase();
+            var headers = { 'Accept': 'application/json' };
+            if (CONFIG.outlookPlusApiKey) headers['X-API-Key'] = CONFIG.outlookPlusApiKey;
+            var url = normalizeLocalApiBase() + path;
+            var data = undefined;
+            if (httpMethod === 'GET') {
+                url += buildQuery(payload || {});
+            } else {
+                headers['Content-Type'] = 'application/json';
+                data = JSON.stringify(payload || {});
+            }
+
+            GM_xmlhttpRequest({
+                method: httpMethod,
+                url: url,
+                headers: headers,
+                data: data,
+                timeout: timeoutMs || 20000,
+                onload: function(r) {
+                    var data = null;
+                    try {
+                        data = JSON.parse(r.responseText || '{}');
+                    } catch (e) {
+                        reject(new Error('Local API returned invalid JSON: HTTP ' + r.status));
+                        return;
+                    }
+
+                    if (r.status < 200 || r.status >= 300 || data.ok === false || data.success === false) {
+                        reject(new Error(data.error || data.message || data.code || 'Local API returned failure'));
+                        return;
+                    }
+                    resolve(data);
+                },
+                onerror: function() {
+                    reject(new Error('Local API request failed'));
+                },
+                ontimeout: function() {
+                    reject(new Error('Local API request timeout'));
+                },
+            });
+        });
+    }
+
+    async function claimOutlookAccount() {
+        if (!CONFIG.outlookPlusApiKey) {
+            throw new Error('Missing pp_outlook_plus_api_key');
+        }
+
+        var taskId = 'xj-gpt-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+        var callerId = 'xj-gpt-registrar-tampermonkey';
+        var data = await externalApiJson('POST', '/api/external/pool/claim-random', {
+            caller_id: callerId,
+            task_id: taskId,
+            provider: 'outlook',
+        }, 20000);
+        var accountData = data && (data.data || data.account || data);
+        if (!accountData || !accountData.email) {
+            throw new Error('Local API did not return an Outlook account');
+        }
+        var account = saveCurrentOutlookAccount({
+            id: accountData.account_id || accountData.id,
+            account_id: accountData.account_id || accountData.id,
+            email: accountData.email,
+            claim_token: accountData.claim_token || '',
+            caller_id: callerId,
+            task_id: taskId,
+        });
+        log('OutlookEmailPlus account claimed: ' + account.email);
+        return account;
+    }
+
+    async function ensureOutlookAccount() {
+        var account = loadCurrentOutlookAccount();
+        if (account && account.email) return account;
+        return await claimOutlookAccount();
+    }
+
+    async function fetchOutlookOtp(email) {
+        if (!CONFIG.outlookPlusApiKey) {
+            throw new Error('Missing pp_outlook_plus_api_key');
+        }
+
+        var account = loadCurrentOutlookAccount() || {};
+        var maxWait = 60;
+        var pollInterval = 3;
+        var waited = 0;
+        var lastError = '';
+
+        while (waited <= maxWait) {
+            if (STATE === 'STOPPED') throw new Error('STOPPED_BY_USER');
+            try {
+                var data = await externalApiJson('GET', '/api/external/verification-code', {
+                    email: email,
+                    folder: 'inbox',
+                    since_minutes: 10,
+                    code_length: '6',
+                    code_source: 'all',
+                    claim_token: account.claim_token || '',
+                }, 20000);
+                var result = data && (data.data || data);
+                var otp = result && (result.verification_code || result.otp || result.code || result.formatted);
+                otp = String(otp || '').replace(/\D/g, '');
+                if (otp) return otp;
+                lastError = 'empty otp';
+            } catch (e) {
+                lastError = e.message;
+            }
+
+            await safeWait(pollInterval * 1000);
+            waited += pollInterval;
+        }
+
+        throw new Error(lastError || 'OutlookEmailPlus OTP timeout');
     }
 
     let chatGptLoginClicked = false;
@@ -623,25 +820,25 @@ var CONFIG = {
         return btn;
     }
 
-    function fillChatGptEmailInput(emailInput) {
+    function fillChatGptEmailInput(emailInput, email) {
         emailInput.scrollIntoView({ block: 'center', inline: 'center' });
         emailInput.focus();
         emailInput.click();
         var inputWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : (emailInput.ownerDocument && emailInput.ownerDocument.defaultView ? emailInput.ownerDocument.defaultView : window);
         var ns = Object.getOwnPropertyDescriptor(inputWindow.HTMLInputElement.prototype, 'value').set;
-        ns.call(emailInput, CONFIG.chatGptLoginEmail);
-        emailInput.setAttribute('value', CONFIG.chatGptLoginEmail);
+        ns.call(emailInput, email);
+        emailInput.setAttribute('value', email);
         emailInput.dispatchEvent(new inputWindow.InputEvent('beforeinput', {
             bubbles: true,
             cancelable: true,
             inputType: 'insertText',
-            data: CONFIG.chatGptLoginEmail,
+            data: email,
         }));
         emailInput.dispatchEvent(new inputWindow.InputEvent('input', {
             bubbles: true,
             cancelable: true,
             inputType: 'insertText',
-            data: CONFIG.chatGptLoginEmail,
+            data: email,
         }));
         emailInput.dispatchEvent(new inputWindow.Event('change', { bubbles: true }));
     }
@@ -651,23 +848,35 @@ var CONFIG = {
         var waited = 0;
         var step = 300;
         var emailFilled = false;
+        var account;
+        var loginEmail;
+
+        try {
+            account = await ensureOutlookAccount();
+            loginEmail = account.email;
+            log('Using Outlook account for ChatGPT login: ' + loginEmail);
+        } catch (e) {
+            updateProgress(0, '领取 Outlook 邮箱失败，请检查本地服务/号池');
+            log('领取 Outlook 邮箱失败，请检查本地服务/号池: ' + e.message);
+            return false;
+        }
 
         while (waited < maxWait) {
             if (STATE === 'STOPPED') return false;
 
             var emailInput = getVisibleChatGptEmailInput();
 
-            if (emailInput && (!emailFilled || emailInput.value !== CONFIG.chatGptLoginEmail)) {
-                fillChatGptEmailInput(emailInput);
-                emailFilled = emailInput.value === CONFIG.chatGptLoginEmail;
+            if (emailInput && (!emailFilled || emailInput.value !== loginEmail)) {
+                fillChatGptEmailInput(emailInput, loginEmail);
+                emailFilled = emailInput.value === loginEmail;
                 updateProgress(45, '已填写 ChatGPT 邮箱，等待继续按钮...');
-                log('✅ 已填写 ChatGPT 邮箱: ' + CONFIG.chatGptLoginEmail + '，当前输入框值: ' + emailInput.value);
+                log('✅ 已填写 ChatGPT 邮箱: ' + loginEmail + '，当前输入框值: ' + emailInput.value);
             }
 
             var continueBtn = findChatGptContinueButton();
-            if (emailInput && emailInput.value === CONFIG.chatGptLoginEmail && continueBtn) {
+            if (emailInput && emailInput.value === loginEmail && continueBtn) {
                 await safeWait(800);
-                if (emailInput.value !== CONFIG.chatGptLoginEmail) {
+                if (emailInput.value !== loginEmail) {
                     emailFilled = false;
                     continue;
                 }
@@ -862,8 +1071,22 @@ var CONFIG = {
         var maxWait = 15000;
         var waited = 0;
         var step = 300;
-        var code = CONFIG.chatGptEmailVerificationCode;
         var codeFilled = false;
+        var account;
+        var code;
+
+        try {
+            account = await ensureOutlookAccount();
+            updateProgress(20, 'Fetching Outlook OTP...');
+            code = await fetchOutlookOtp(account.email);
+            if (!code) throw new Error('Empty OTP');
+            log('Fetched Outlook OTP for ' + account.email + ': ' + code);
+        } catch (e) {
+            clearCurrentOutlookAccount();
+            updateProgress(0, '获取 Outlook 验证码失败，请手动输入');
+            log('获取 Outlook 验证码失败，请手动输入: ' + e.message);
+            return false;
+        }
 
         while (waited < maxWait) {
             if (STATE === 'STOPPED') return false;
@@ -881,9 +1104,9 @@ var CONFIG = {
             }
 
             var btn = findEmailVerificationSubmitButton();
-            if (codeFilled && btn && getCurrentOtpValue().endsWith(code)) {
+            if (codeFilled && btn && getCurrentOtpValue() === code) {
                 await safeWait(800);
-                if (!getCurrentOtpValue().endsWith(code)) {
+                if (getCurrentOtpValue() !== code) {
                     codeFilled = false;
                     continue;
                 }
@@ -899,6 +1122,131 @@ var CONFIG = {
 
         updateProgress(10, '未找到邮箱验证码输入区域或确认按钮');
         log('未找到邮箱验证码输入区域或确认按钮');
+        return false;
+    }
+
+    function randomChatGptFullName() {
+        var firstNames = ['James', 'Michael', 'Daniel', 'David', 'Ryan', 'Kevin', 'Brian', 'Jason', 'Eric', 'Mark'];
+        var lastNames = ['Smith', 'Johnson', 'Brown', 'Davis', 'Miller', 'Wilson', 'Moore', 'Taylor', 'Anderson', 'Thomas'];
+        return firstNames[Math.floor(Math.random() * firstNames.length)] + ' ' + lastNames[Math.floor(Math.random() * lastNames.length)];
+    }
+
+    function findInputByVisibleLabel(labelText) {
+        var labels = Array.from(document.querySelectorAll('label'));
+        for (var i = 0; i < labels.length; i++) {
+            var label = labels[i];
+            if (!(label.textContent || '').includes(labelText)) continue;
+
+            var forId = label.getAttribute('for');
+            if (forId) {
+                var byId = document.getElementById(forId);
+                if (byId && 'value' in byId) return byId;
+            }
+
+            var nested = label.querySelector('input, textarea');
+            if (nested) return nested;
+
+            var wrapper = label.closest('div');
+            for (var depth = 0; wrapper && depth < 4; depth++) {
+                var nearby = wrapper.querySelector('input, textarea');
+                if (nearby) return nearby;
+                wrapper = wrapper.parentElement;
+            }
+        }
+        return null;
+    }
+
+    function getVisibleInputFromCandidates(candidates) {
+        for (var i = 0; i < candidates.length; i++) {
+            var el = candidates[i];
+            if (!el || el.disabled || !('value' in el)) continue;
+            var rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) return el;
+        }
+        return null;
+    }
+
+    function findAboutYouFullNameInput() {
+        return getVisibleInputFromCandidates([
+            findInputByVisibleLabel('全名'),
+            document.querySelector('input[name="name"]'),
+            document.querySelector('input[name="fullName"]'),
+            document.querySelector('input[name="full_name"]'),
+            document.querySelector('input[autocomplete="name"]'),
+            document.querySelector('input[aria-label*="全名"]'),
+            document.querySelector('input[placeholder*="全名"]'),
+        ]);
+    }
+
+    function findAboutYouAgeInput() {
+        return getVisibleInputFromCandidates([
+            findInputByVisibleLabel('年龄'),
+            document.querySelector('input[name="age"]'),
+            document.querySelector('input[aria-label*="年龄"]'),
+            document.querySelector('input[placeholder*="年龄"]'),
+            document.querySelector('input[inputmode="numeric"]'),
+            document.querySelector('input[type="number"]'),
+        ]);
+    }
+
+    function findAboutYouSubmitButton() {
+        var buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
+        return buttons.find(function(btn) {
+            var text = (btn.textContent || '').trim();
+            var rect = btn.getBoundingClientRect();
+            var actionName = btn.getAttribute('data-dd-action-name') || '';
+            return !btn.disabled && btn.getAttribute('aria-disabled') !== 'true' && rect.width > 0 && rect.height > 0 && (
+                actionName === 'Continue' ||
+                text.includes('完成帐户创建') ||
+                text.includes('完成账户创建') ||
+                text.toLowerCase().includes('continue')
+            );
+        }) || null;
+    }
+
+    async function autoFillAboutYou() {
+        var maxWait = 15000;
+        var waited = 0;
+        var step = 300;
+        var fullName = randomChatGptFullName();
+        var age = '23';
+        var filled = false;
+
+        while (waited < maxWait) {
+            if (STATE === 'STOPPED') return false;
+
+            var nameInput = findAboutYouFullNameInput();
+            var ageInput = findAboutYouAgeInput();
+
+            if (nameInput && ageInput && !filled) {
+                var nameOk = setElementTextLikeInput(nameInput, fullName);
+                var ageOk = setElementTextLikeInput(ageInput, age);
+                filled = nameOk && ageOk && nameInput.value === fullName && ageInput.value === age;
+                if (filled) {
+                    updateProgress(65, '已填写全名和年龄，等待完成按钮...');
+                    log('✅ 已填写 About You: ' + fullName + ', age=' + age);
+                }
+            }
+
+            var btn = findAboutYouSubmitButton();
+            if (filled && btn && nameInput && ageInput && nameInput.value === fullName && ageInput.value === age) {
+                await safeWait(800);
+                if (nameInput.value !== fullName || ageInput.value !== age) {
+                    filled = false;
+                    continue;
+                }
+                robustClickElement(btn);
+                updateProgress(100, '已填写资料并点击完成帐户创建');
+                log('✅ 已点击完成帐户创建按钮');
+                return true;
+            }
+
+            await safeWait(step);
+            waited += step;
+        }
+
+        updateProgress(10, '未找到全名/年龄输入框或完成按钮');
+        log('未找到 About You 全名/年龄输入框或完成按钮');
         return false;
     }
 
@@ -983,6 +1331,11 @@ var CONFIG = {
             // -- 场景〇：ChatGPT主站 (等待点击按钮获取链接) --
             // ============================================
             if (host.includes('chatgpt.com') || host.includes('auth.openai.com')) {
+                if (host.includes('auth.openai.com') && path.includes('/about-you')) {
+                    updateProgress(10, '正在等待全名和年龄输入框...');
+                    await autoFillAboutYou();
+                    return;
+                }
                 if (host.includes('auth.openai.com') && path.includes('/email-verification')) {
                     updateProgress(10, '正在等待邮箱验证码输入区域...');
                     await autoFillEmailVerificationCode();
