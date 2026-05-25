@@ -31,8 +31,8 @@ var CONFIG = {
     cardNumber: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardNumber', '5436103552508504') : '5436103552508504',
     cardExpiry: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardExpiry', '05 / 29') : '05 / 29',
     cardCvv: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardCvv', '717') : '717',
-    localApiBase: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_local_api_base', 'http://127.0.0.1:5001') : 'http://127.0.0.1:5001',
-    outlookPlusApiKey: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_outlook_plus_api_key', 'hoI7kOgnDRlwdhBXxYjhrk2LAFdszhtZp-cquoXWKFGsr-0rJNnChEb3bAqAU5rz') : 'hoI7kOgnDRlwdhBXxYjhrk2LAFdszhtZp-cquoXWKFGsr-0rJNnChEb3bAqAU5rz',
+    localApiBase: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_email_manage_api_base', 'http://175.178.66.87:8000') : 'http://175.178.66.87:8000',
+    outlookPlusApiKey: '',
     chatGptLoginEmail: '',
     chatGptEmailVerificationCode: ''
 };
@@ -43,6 +43,7 @@ var CONFIG = {
     // 全局运行状态：'RUNNING', 'PAUSED', 'STOPPED'
     var STATE = 'RUNNING';
     var currentOutlookAccount = null;
+    var emailVerificationStartedAt = 0;
 
     // ========== 1. 悬浮窗及日志/进度系统 ==========
     var logBox, progressBar, progressText, stepDesc;
@@ -343,7 +344,7 @@ var CONFIG = {
     }
 
     function normalizeLocalApiBase() {
-        return String(CONFIG.localApiBase || 'http://127.0.0.1:5001').replace(/\/+$/, '');
+        return String(CONFIG.localApiBase || 'http://127.0.0.1:8000').replace(/\/+$/, '');
     }
 
     function parseStoredOutlookAccount(raw) {
@@ -358,6 +359,7 @@ var CONFIG = {
                     claim_token: account.claim_token || '',
                     caller_id: account.caller_id || '',
                     task_id: account.task_id || '',
+                    claimed_at: account.claimed_at || '',
                 };
             }
         } catch (e) {}
@@ -379,6 +381,7 @@ var CONFIG = {
             claim_token: account.claim_token || '',
             caller_id: account.caller_id || '',
             task_id: account.task_id || '',
+            claimed_at: account.claimed_at || '',
         };
         if (typeof GM_setValue !== 'undefined') {
             GM_setValue('pp_current_outlook_account', JSON.stringify(currentOutlookAccount));
@@ -391,6 +394,23 @@ var CONFIG = {
         if (typeof GM_setValue !== 'undefined') {
             GM_setValue('pp_current_outlook_account', '');
         }
+    }
+
+    function saveEmailVerificationStartedAt(ts) {
+        emailVerificationStartedAt = ts || (Date.now() / 1000);
+        if (typeof GM_setValue !== 'undefined') {
+            GM_setValue('pp_email_verification_started_at', String(emailVerificationStartedAt));
+        }
+        return emailVerificationStartedAt;
+    }
+
+    function loadEmailVerificationStartedAt() {
+        if (emailVerificationStartedAt) return emailVerificationStartedAt;
+        if (typeof GM_getValue !== 'undefined') {
+            var raw = parseFloat(GM_getValue('pp_email_verification_started_at', '0'));
+            if (raw > 0) emailVerificationStartedAt = raw;
+        }
+        return emailVerificationStartedAt;
     }
 
     function buildQuery(params) {
@@ -454,36 +474,23 @@ var CONFIG = {
     }
 
     async function claimOutlookAccount() {
-        if (!CONFIG.outlookPlusApiKey) {
-            throw new Error('Missing pp_outlook_plus_api_key');
-        }
-
-        var taskId = 'xj-gpt-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-        var callerId = 'xj-gpt-registrar-tampermonkey';
-        var data = await externalApiJson('POST', '/api/external/pool/claim-random', {
-            caller_id: callerId,
-            task_id: taskId,
-            provider: 'outlook',
-        }, 20000);
-        var accountData = data && (data.data || data.account || data);
-        if (!accountData || !accountData.email) {
-            throw new Error('Local API did not return an Outlook account');
-        }
         var account = saveCurrentOutlookAccount({
-            id: accountData.account_id || accountData.id,
-            account_id: accountData.account_id || accountData.id,
-            email: accountData.email,
-            claim_token: accountData.claim_token || '',
-            caller_id: callerId,
-            task_id: taskId,
+            id: 'direct',
+            account_id: 'direct',
+            email: 'ArtaLioi368326@hotmail.com',
+            claim_token: '',
+            caller_id: 'emailManage-direct',
+            task_id: '',
+            claimed_at: new Date().toISOString(),
         });
-        log('OutlookEmailPlus account claimed: ' + account.email);
+        log('emailManage direct account selected');
         return account;
     }
 
     async function ensureOutlookAccount() {
         var account = loadCurrentOutlookAccount();
-        if (account && account.email) return account;
+        if (account && account.email && account.caller_id === 'emailManage-direct' && account.claimed_at) return account;
+        if (account && account.email) clearCurrentOutlookAccount();
         return await claimOutlookAccount();
     }
 
@@ -526,83 +533,61 @@ var CONFIG = {
     }
 
     async function fetchOutlookOtpFromLatestMessage(email) {
-        var latestData = await externalApiJson('GET', '/api/external/messages/latest', {
-            email: email,
-            folder: 'inbox',
-            since_minutes: 1440,
+        var account = loadCurrentOutlookAccount() || {};
+        if (!account.account_id && !account.id) {
+            throw new Error('missing emailManage mailbox id');
+        }
+
+        var mailboxId = account.account_id || account.id;
+        var messages = await externalApiJson('GET', '/api/mailboxes/' + encodeURIComponent(String(mailboxId)) + '/messages', {
+            limit: 10,
+            after_claim: 'true',
         }, 20000);
-        var latest = latestData && (latestData.data || latestData);
+        if (!Array.isArray(messages) || !messages.length) {
+            throw new Error('emailManage returned no messages');
+        }
+
+        var latest = messages[0];
         var messageId = latest && latest.id;
         if (!messageId) {
             throw new Error('latest message did not include id');
         }
 
-        var detailData = await externalApiJson('GET', '/api/external/messages/' + encodeURIComponent(String(messageId)), {
-            email: email,
-            folder: 'inbox',
-        }, 20000);
-        var detail = detailData && (detailData.data || detailData);
+        var detail = await externalApiJson('GET', '/api/messages/' + encodeURIComponent(String(messageId)), {}, 20000);
         var sourceText = [
             detail && detail.subject,
-            detail && detail.content,
-            detail && detail.html_content,
-            detail && detail.raw_content,
+            detail && detail.text_body,
+            detail && detail.html_body,
+            detail && detail.code,
             latest && latest.subject,
-            latest && latest.content_preview,
+            latest && latest.code,
         ].filter(Boolean).join(' ');
         var otp = extractSixDigitOtpFromText(sourceText);
         if (!otp) {
-            throw new Error('messages detail fallback found no 6-digit otp');
+            throw new Error('emailManage messages detail fallback found no 6-digit otp');
         }
-        log('Outlook OTP source: messages detail fallback, message_id=' + messageId);
+        log('Outlook OTP source: emailManage messages detail fallback, message_id=' + messageId);
         return otp;
     }
 
     async function fetchOutlookOtp(email) {
-        if (!CONFIG.outlookPlusApiKey) {
-            throw new Error('Missing pp_outlook_plus_api_key');
-        }
-
-        var account = loadCurrentOutlookAccount() || {};
+        var afterTs = loadEmailVerificationStartedAt() || (Date.now() / 1000);
         var maxWait = 60;
         var pollInterval = 3;
-        var waited = 0;
-        var lastError = '';
 
-        while (waited <= maxWait) {
-            if (STATE === 'STOPPED') throw new Error('STOPPED_BY_USER');
-            try {
-                var data = await externalApiJson('GET', '/api/external/verification-code', {
-                    email: email,
-                    folder: 'inbox',
-                    since_minutes: 10,
-                    code_length: '6',
-                    code_source: 'all',
-                    claim_token: account.claim_token || '',
-                }, 20000);
-                var result = data && (data.data || data);
-                var otp = result && (result.verification_code || result.otp || result.code || result.formatted);
-                otp = String(otp || '').replace(/\D/g, '');
-                if (otp) {
-                    log('Outlook OTP source: verification-code');
-                    return otp;
-                }
-                lastError = 'empty otp';
-            } catch (e) {
-                lastError = e.message;
-            }
-
-            try {
-                return await fetchOutlookOtpFromLatestMessage(email);
-            } catch (fallbackError) {
-                lastError = lastError ? (lastError + '; fallback: ' + fallbackError.message) : fallbackError.message;
-            }
-
-            await safeWait(pollInterval * 1000);
-            waited += pollInterval;
+        if (STATE === 'STOPPED') throw new Error('STOPPED_BY_USER');
+        var data = await externalApiJson('POST', '/api/direct/latest-code', {
+            after_ts: afterTs,
+            max_wait: maxWait,
+            poll_interval: pollInterval,
+            settle_seconds: 2,
+        }, (maxWait + 10) * 1000);
+        var otp = String((data && data.otp) || '').replace(/\D/g, '');
+        if (!otp) {
+            throw new Error('emailManage direct latest-code returned empty otp');
         }
-
-        throw new Error(lastError || 'OutlookEmailPlus OTP timeout');
+        log('Outlook OTP source: emailManage direct latest-code, email=' + ((data && data.email) || email));
+        return otp;
     }
 
     let chatGptLoginClicked = false;
@@ -960,6 +945,7 @@ var CONFIG = {
                     emailFilled = false;
                     continue;
                 }
+                saveEmailVerificationStartedAt(Date.now() / 1000);
                 robustClickElement(continueBtn);
                 updateProgress(100, '已填写 ChatGPT 邮箱并点击继续');
                 log('✅ 已点击邮箱表单的继续按钮');
@@ -1148,6 +1134,7 @@ var CONFIG = {
     }
 
     async function autoFillEmailVerificationCode() {
+        if (!loadEmailVerificationStartedAt()) saveEmailVerificationStartedAt(Date.now() / 1000);
         var maxWait = 15000;
         var waited = 0;
         var step = 300;
