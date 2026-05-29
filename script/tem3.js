@@ -27,7 +27,7 @@
 // ==/UserScript==
 // 使用 GM_getValue 读取本地保存的配置，如果没有则使用默认值
 var CONFIG = {
-    phone: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_phone', '5825834952') : '5825834952',
+    phone: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_phone', '3502234709') : '3502234709',
     cardNumber: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardNumber', '5436103552508504') : '5436103552508504',
     cardExpiry: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardExpiry', '05 / 29') : '05 / 29',
     cardCvv: typeof GM_getValue !== 'undefined' ? GM_getValue('pp_cardCvv', '717') : '717',
@@ -44,6 +44,7 @@ var CONFIG = {
     var STATE = 'RUNNING';
     var currentOutlookAccount = null;
     var emailVerificationStartedAt = 0;
+    var emailVerificationAutoFillRunning = false;
 
     // ========== 1. 悬浮窗及日志/进度系统 ==========
     var logBox, progressBar, progressText, stepDesc;
@@ -396,6 +397,64 @@ var CONFIG = {
         }
     }
 
+    function parseStoredPlusMarkPending(raw) {
+        if (!raw) return null;
+        try {
+            var pending = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            if (pending && pending.email) {
+                return {
+                    id: pending.id || pending.account_id || pending.mailbox_id || null,
+                    account_id: pending.account_id || pending.mailbox_id || pending.id || null,
+                    mailbox_id: pending.mailbox_id || pending.account_id || pending.id || null,
+                    email: String(pending.email),
+                    caller_id: pending.caller_id || '',
+                    submitted_at: pending.submitted_at || '',
+                    submitted_ts: Number(pending.submitted_ts || 0),
+                    expired_logged: !!pending.expired_logged,
+                };
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    function loadPlusMarkPending() {
+        if (typeof GM_getValue === 'undefined') return null;
+        return parseStoredPlusMarkPending(GM_getValue('pp_plus_mark_pending', null));
+    }
+
+    function savePlusMarkPending(pending) {
+        if (typeof GM_setValue !== 'undefined') {
+            GM_setValue('pp_plus_mark_pending', JSON.stringify(pending || {}));
+        }
+        return pending;
+    }
+
+    function clearPlusMarkPending() {
+        if (typeof GM_setValue !== 'undefined') {
+            GM_setValue('pp_plus_mark_pending', '');
+        }
+    }
+
+    function savePlusMarkPendingFromCurrentAccount() {
+        var account = loadCurrentOutlookAccount();
+        if (!account || !account.email) {
+            log('未找到当前 Outlook 邮箱，无法保存 Plus 待确认状态');
+            return false;
+        }
+        var pending = savePlusMarkPending({
+            id: account.id,
+            account_id: account.account_id || account.id,
+            mailbox_id: account.account_id || account.id,
+            email: account.email,
+            caller_id: account.caller_id || '',
+            submitted_at: new Date().toISOString(),
+            submitted_ts: Date.now() / 1000,
+            expired_logged: false,
+        });
+        log('已保存 Plus 状态待确认: ' + pending.email);
+        return true;
+    }
+
     function saveEmailVerificationStartedAt(ts) {
         emailVerificationStartedAt = ts || (Date.now() / 1000);
         if (typeof GM_setValue !== 'undefined') {
@@ -411,6 +470,57 @@ var CONFIG = {
             if (raw > 0) emailVerificationStartedAt = raw;
         }
         return emailVerificationStartedAt;
+    }
+
+    function parseEmailVerificationResendState(raw) {
+        if (!raw) return null;
+        try {
+            var state = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            if (!state || !state.email) return null;
+            return {
+                email: String(state.email),
+                mailbox_id: state.mailbox_id || state.account_id || state.id || null,
+                started_at: Number(state.started_at || 0),
+                resend_count: Math.max(0, parseInt(state.resend_count || 0, 10) || 0),
+                last_resend_at: Number(state.last_resend_at || 0),
+            };
+        } catch (e) {}
+        return null;
+    }
+
+    function loadEmailVerificationResendState(account, startedAt) {
+        if (typeof GM_getValue === 'undefined') return null;
+        var state = parseEmailVerificationResendState(GM_getValue('pp_email_verification_resend_state', null));
+        if (!state) return null;
+
+        var accountEmail = account && account.email ? String(account.email).toLowerCase() : '';
+        if (accountEmail && String(state.email).toLowerCase() !== accountEmail) return null;
+
+        var mailboxId = getNumericOutlookAccountId(account);
+        if (mailboxId && state.mailbox_id && String(state.mailbox_id) !== String(mailboxId)) return null;
+
+        if (startedAt && state.started_at && Math.abs(Number(startedAt) - Number(state.started_at)) > 2) return null;
+        return state;
+    }
+
+    function saveEmailVerificationResendState(account, startedAt, resendCount, lastResendAt) {
+        var state = {
+            email: account && account.email ? String(account.email) : '',
+            mailbox_id: getNumericOutlookAccountId(account),
+            started_at: Number(startedAt || 0),
+            resend_count: Math.max(0, parseInt(resendCount || 0, 10) || 0),
+            last_resend_at: Number(lastResendAt || 0),
+        };
+        if (typeof GM_setValue !== 'undefined') {
+            GM_setValue('pp_email_verification_resend_state', JSON.stringify(state));
+        }
+        return state;
+    }
+
+    function clearEmailVerificationResendState() {
+        if (typeof GM_setValue !== 'undefined') {
+            GM_setValue('pp_email_verification_resend_state', '');
+        }
     }
 
     function buildQuery(params) {
@@ -458,7 +568,8 @@ var CONFIG = {
                     }
 
                     if (r.status < 200 || r.status >= 300 || data.ok === false || data.success === false) {
-                        reject(new Error(data.error || data.message || data.code || 'Local API returned failure'));
+                        var detail = data.error || data.message || data.code || JSON.stringify(data).slice(0, 500) || r.responseText || 'Local API returned failure';
+                        reject(new Error('HTTP ' + r.status + ' ' + detail));
                         return;
                     }
                     resolve(data);
@@ -473,7 +584,54 @@ var CONFIG = {
         });
     }
 
+    function parseEmailManageMailbox(raw) {
+        var mailbox = (raw && (raw.mailbox || raw.account || raw.item)) || raw;
+        if (!mailbox || !mailbox.email) return null;
+        return saveCurrentOutlookAccount({
+            id: mailbox.id || mailbox.mailbox_id || mailbox.account_id,
+            account_id: mailbox.id || mailbox.mailbox_id || mailbox.account_id,
+            email: mailbox.email,
+            claim_token: '',
+            caller_id: 'emailManage-mailbox',
+            task_id: '',
+            claimed_at: mailbox.claimed_at || new Date().toISOString(),
+        });
+    }
+
     async function claimOutlookAccount() {
+        try {
+            var mailboxData = await externalApiJson('POST', '/api/mailboxes/claim', {}, 20000);
+            var mailboxAccount = parseEmailManageMailbox(mailboxData);
+            if (mailboxAccount && mailboxAccount.email) {
+                log('emailManage mailbox selected: ' + mailboxAccount.email + ', id=' + mailboxAccount.account_id);
+                return mailboxAccount;
+            }
+            throw new Error('emailManage claim returned no mailbox');
+        } catch (e) {
+            log('领取 emailManage 邮箱失败，尝试本项目 Outlook pool fallback: ' + e.message);
+        }
+
+        try {
+            var data = await externalApiJson('POST', '/api/outlook/pool/claim', {}, 20000);
+            var claimed = data && data.account;
+            if (claimed && claimed.email) {
+                var account = saveCurrentOutlookAccount({
+                    id: claimed.id,
+                    account_id: claimed.id,
+                    email: claimed.email,
+                    claim_token: '',
+                    caller_id: 'outlook-pool',
+                    task_id: '',
+                    claimed_at: claimed.claimed_at || new Date().toISOString(),
+                });
+                log('Outlook pool account selected: ' + account.email + ', id=' + account.account_id);
+                return account;
+            }
+            throw new Error((data && data.error) || 'Outlook pool returned no account');
+        } catch (e) {
+            log('领取 Outlook 号池账号失败，尝试 direct fallback: ' + e.message);
+        }
+
         var account = saveCurrentOutlookAccount({
             id: 'direct',
             account_id: 'direct',
@@ -489,9 +647,189 @@ var CONFIG = {
 
     async function ensureOutlookAccount() {
         var account = loadCurrentOutlookAccount();
-        if (account && account.email && account.caller_id === 'emailManage-direct' && account.claimed_at) return account;
+        if (account && account.caller_id === 'emailManage-direct' && normalizeLocalApiBase().includes('175.178.66.87')) {
+            clearCurrentOutlookAccount();
+            account = null;
+        }
+        if (account && account.email && account.claimed_at) return account;
         if (account && account.email) clearCurrentOutlookAccount();
         return await claimOutlookAccount();
+    }
+
+    function getNumericOutlookAccountId(account) {
+        var rawId = account && (account.account_id || account.id);
+        if (rawId === undefined || rawId === null || rawId === '') return null;
+        if (!/^\d+$/.test(String(rawId))) return null;
+        return parseInt(rawId, 10);
+    }
+
+    async function findOutlookPoolIdByEmail(email) {
+        if (!email) return null;
+        var data = await externalApiJson('GET', '/api/outlook/pool', {
+            q: email,
+            limit: 20,
+        }, 20000);
+        var target = String(email).toLowerCase();
+        var items = Array.isArray(data && data.items) ? data.items : [];
+        var row = items.find(function(item) {
+            return item && String(item.email || '').toLowerCase() === target;
+        });
+        return row && row.id ? parseInt(row.id, 10) : null;
+    }
+
+    async function markOutlookAccountPlusCreated(account) {
+        if (!account || !account.email) {
+            log('未找到当前 Outlook 邮箱，跳过 GPT Plus 状态更新');
+            return false;
+        }
+
+        try {
+            var rowId = getNumericOutlookAccountId(account);
+            if (rowId) {
+                try {
+                    await externalApiJson('POST', '/api/mailboxes/' + encodeURIComponent(String(rowId)) + '/flags', {
+                        is_registered_gpt: true,
+                        is_plus: true,
+                    }, 20000);
+                    log('✅ 已更新 emailManage 邮箱状态为 GPT 已注册 / Plus 已开通: ' + account.email);
+                    return true;
+                } catch (e) {
+                    log('emailManage flags 更新失败，尝试本项目 Outlook pool fallback: ' + e.message);
+                }
+            }
+
+            if (!rowId) rowId = await findOutlookPoolIdByEmail(account.email);
+            if (!rowId) {
+                log('未在号池中找到当前邮箱，无法标记 GPT Plus: ' + account.email);
+                return false;
+            }
+
+            var data = await externalApiJson('PATCH', '/api/outlook/pool/' + encodeURIComponent(String(rowId)), {
+                status: 'used',
+                has_gptplus: true,
+            }, 20000);
+            saveCurrentOutlookAccount(Object.assign({}, account, {
+                id: rowId,
+                account_id: rowId,
+            }));
+            log('✅ 已更新邮箱 GPT 状态为已创建 Plus: ' + ((data && data.item && data.item.email) || account.email));
+            return true;
+        } catch (e) {
+            log('❌ 更新邮箱 GPT Plus 状态失败: ' + e.message);
+            return false;
+        }
+    }
+
+    async function markCurrentOutlookAccountPlusCreated() {
+        return await markOutlookAccountPlusCreated(loadCurrentOutlookAccount());
+    }
+
+    function containsPaidPlanSignal(value, parentKey, depth) {
+        if (depth > 8 || value === null || value === undefined) return false;
+        var key = String(parentKey || '').toLowerCase();
+        var paidWords = ['plus', 'pro', 'team', 'enterprise', 'business'];
+        if (typeof value === 'boolean') {
+            return value === true && (
+                key.includes('plus') ||
+                key.includes('paid') ||
+                key.includes('subscriber') ||
+                key.includes('subscription')
+            );
+        }
+        if (typeof value === 'string') {
+            var text = value.toLowerCase();
+            var keyLooksRelevant = key.includes('plan') || key.includes('subscription') || key.includes('sku') || key.includes('product') || key.includes('account');
+            return keyLooksRelevant && paidWords.some(function(word) {
+                return text.includes(word);
+            }) && !text.includes('free');
+        }
+        if (Array.isArray(value)) {
+            return value.some(function(item) {
+                return containsPaidPlanSignal(item, parentKey, depth + 1);
+            });
+        }
+        if (typeof value === 'object') {
+            return Object.keys(value).some(function(childKey) {
+                return containsPaidPlanSignal(value[childKey], childKey, depth + 1);
+            });
+        }
+        return false;
+    }
+
+    async function hasChatGptPaidPlanFromApi() {
+        var endpoints = [
+            '/backend-api/accounts/check/v4-2023-04-27',
+            '/backend-api/settings/user',
+        ];
+        for (var i = 0; i < endpoints.length; i++) {
+            try {
+                var response = await fetch(endpoints[i], { credentials: 'include' });
+                if (!response || !response.ok) continue;
+                var data = await response.json();
+                if (containsPaidPlanSignal(data, '', 0)) return true;
+            } catch (e) {}
+        }
+        return false;
+    }
+
+    function hasVisiblePlusSuccessSignal() {
+        var href = String(window.location.href || '').toLowerCase();
+        if (
+            (href.includes('success') || href.includes('complete')) &&
+            (href.includes('payment') || href.includes('checkout') || href.includes('subscription') || href.includes('plus'))
+        ) {
+            return true;
+        }
+        var text = ((document.body && document.body.innerText) || '').slice(0, 12000).toLowerCase();
+        var signals = [
+            'payment successful',
+            'payment complete',
+            'subscription active',
+            'you are now subscribed',
+            "you're now subscribed",
+            'welcome to chatgpt plus',
+            'plus is active',
+            '付款成功',
+            '订阅已激活',
+            '已开通 plus',
+            'plus 已开通',
+        ];
+        return signals.some(function(signal) {
+            return text.includes(signal);
+        });
+    }
+
+    async function checkAndMarkPendingPlusIfReady() {
+        var pending = loadPlusMarkPending();
+        if (!pending || !pending.email) return false;
+
+        var submittedTs = pending.submitted_ts || (pending.submitted_at ? Date.parse(pending.submitted_at) / 1000 : 0);
+        var ageSeconds = submittedTs ? (Date.now() / 1000 - submittedTs) : 0;
+        if (ageSeconds > 6 * 60 * 60) {
+            if (!pending.expired_logged) {
+                pending.expired_logged = true;
+                savePlusMarkPending(pending);
+                log('Plus 待确认状态已超过 6 小时，暂不自动标记: ' + pending.email);
+            }
+            return false;
+        }
+
+        var success = false;
+        if (window.location.host.includes('chatgpt.com') || window.location.host.includes('chat.openai.com')) {
+            success = await hasChatGptPaidPlanFromApi();
+        }
+        if (!success) success = hasVisiblePlusSuccessSignal();
+        if (!success) {
+            log('Plus 待确认中，尚未检测到成功信号: ' + pending.email);
+            return false;
+        }
+
+        var marked = await markOutlookAccountPlusCreated(pending);
+        if (marked) {
+            clearPlusMarkPending();
+            log('已清除 Plus 待确认状态: ' + pending.email);
+        }
+        return marked;
     }
 
     function stripHtmlForOtp(text) {
@@ -570,24 +908,152 @@ var CONFIG = {
         return otp;
     }
 
-    async function fetchOutlookOtp(email) {
+    function extractOtpFromEmailManageMessages(messages, afterTs) {
+        for (var i = 0; i < messages.length; i++) {
+            var item = messages[i] || {};
+            if (afterTs && !isEmailManageMessageFresh(item, afterTs)) continue;
+            var sourceText = [
+                item.subject,
+                item.text_body,
+                item.html_body,
+                item.body,
+                item.preview,
+                item.code,
+            ].filter(Boolean).join(' ');
+            var otp = extractSixDigitOtpFromText(sourceText);
+            if (otp) return otp;
+        }
+        return '';
+    }
+
+    function isEmailManageMessageFresh(message, afterTs) {
+        if (!message || !afterTs) return true;
+        var rawTs = message.sent_at || message.sentAt || message.received_at || message.receivedAt ||
+            message.created_at || message.createdAt || message.date || message.receivedDateTime || '';
+        if (!rawTs) return true;
+        var sentMs = Date.parse(rawTs);
+        if (!sentMs) return true;
+        return sentMs / 1000 >= afterTs - 5;
+    }
+
+    async function logEmailManageMailboxStatus(mailboxId) {
+        try {
+            var mailboxData = await externalApiJson('GET', '/api/mailboxes', {}, 20000);
+            var mailboxes = Array.isArray(mailboxData) ? mailboxData :
+                (Array.isArray(mailboxData && mailboxData.items) ? mailboxData.items :
+                (Array.isArray(mailboxData && mailboxData.mailboxes) ? mailboxData.mailboxes : []));
+            if (!mailboxes.length) return;
+            var mailbox = mailboxes.find(function(item) {
+                return item && String(item.id) === String(mailboxId);
+            });
+            if (!mailbox) return;
+            log('emailManage mailbox status: id=' + mailboxId +
+                ', status=' + (mailbox.status || '-') +
+                ', latest_code=' + (mailbox.latest_code || '-') +
+                ', last_error=' + (mailbox.last_error || '-'));
+        } catch (e) {}
+    }
+
+    async function fetchEmailManageMailboxOtp(email, afterTs, maxWait, pollInterval) {
+        var account = loadCurrentOutlookAccount() || {};
+        var mailboxId = getNumericOutlookAccountId(account);
+        if (!mailboxId) {
+            throw new Error('missing numeric emailManage mailbox id');
+        }
+
+        var deadline = Date.now() + maxWait * 1000;
+        var lastError = '';
+        while (Date.now() < deadline) {
+            if (STATE === 'STOPPED') throw new Error('STOPPED_BY_USER');
+
+            try {
+                await externalApiJson('POST', '/api/mailboxes/' + encodeURIComponent(String(mailboxId)) + '/sync', {}, 30000);
+            } catch (e) {
+                lastError = e.message;
+                log('emailManage mailbox sync failed: ' + e.message);
+                await logEmailManageMailboxStatus(mailboxId);
+            }
+
+            try {
+                var codeData = await externalApiJson('GET', '/api/mailboxes/' + encodeURIComponent(String(mailboxId)) + '/code', {}, 20000);
+                var message = (codeData && (codeData.message || codeData.item || codeData.mail)) || codeData;
+                var codeOtp = String((message && (message.code || message.otp || message.latest_code)) || '').replace(/\D/g, '');
+                if (codeOtp && codeOtp.length === 6 && isEmailManageMessageFresh(message, afterTs)) {
+                    log('Outlook OTP source: emailManage mailbox code endpoint, email=' + email + ', id=' + mailboxId);
+                    return codeOtp;
+                }
+            } catch (eCode) {
+                lastError = eCode.message;
+            }
+
+            try {
+                var messages = await externalApiJson('GET', '/api/mailboxes/' + encodeURIComponent(String(mailboxId)) + '/messages', {
+                    limit: 10,
+                    after_claim: 'true',
+                }, 20000);
+                var messageItems = Array.isArray(messages) ? messages :
+                    (Array.isArray(messages && messages.items) ? messages.items :
+                    (Array.isArray(messages && messages.messages) ? messages.messages : []));
+                if (messageItems.length) {
+                    var otp = extractOtpFromEmailManageMessages(messageItems, afterTs);
+                    if (otp) {
+                        log('Outlook OTP source: emailManage mailbox messages, email=' + email + ', id=' + mailboxId);
+                        return otp;
+                    }
+                }
+            } catch (e2) {
+                lastError = e2.message;
+            }
+
+            await safeWait(pollInterval * 1000);
+        }
+
+        throw new Error('emailManage mailbox OTP not found' + (lastError ? ': ' + lastError : ''));
+    }
+
+    async function fetchOutlookOtp(email, options) {
+        options = options || {};
         var afterTs = loadEmailVerificationStartedAt() || (Date.now() / 1000);
-        var maxWait = 60;
-        var pollInterval = 3;
+        var maxWait = options.maxWait || 60;
+        var pollInterval = options.pollInterval || 3;
 
         if (STATE === 'STOPPED') throw new Error('STOPPED_BY_USER');
-        var data = await externalApiJson('POST', '/api/direct/latest-code', {
+
+        var account = loadCurrentOutlookAccount() || {};
+        if (getNumericOutlookAccountId(account)) {
+            return await fetchEmailManageMailboxOtp(email, afterTs, maxWait, pollInterval);
+        }
+
+        try {
+            var data = await externalApiJson('POST', '/api/direct/latest-code', {
+                after_ts: afterTs,
+                max_wait: maxWait,
+                poll_interval: pollInterval,
+                settle_seconds: 2,
+            }, (maxWait + 10) * 1000);
+            var otp = String((data && data.otp) || '').replace(/\D/g, '');
+            if (otp) {
+                log('Outlook OTP source: emailManage direct latest-code, email=' + ((data && data.email) || email));
+                return otp;
+            }
+            throw new Error('emailManage direct latest-code returned empty otp');
+        } catch (e) {
+            if (normalizeLocalApiBase().includes('175.178.66.87')) throw e;
+            log('emailManage direct 取码失败，尝试本项目 Outlook fallback: ' + e.message);
+        }
+
+        var localData = await externalApiJson('POST', '/api/outlook/latest-otp', {
+            email: email,
             after_ts: afterTs,
             max_wait: maxWait,
             poll_interval: pollInterval,
-            settle_seconds: 2,
         }, (maxWait + 10) * 1000);
-        var otp = String((data && data.otp) || '').replace(/\D/g, '');
-        if (!otp) {
-            throw new Error('emailManage direct latest-code returned empty otp');
+        var localOtp = String((localData && localData.otp) || '').replace(/\D/g, '');
+        if (!localOtp) {
+            throw new Error('local outlook latest-otp returned empty otp');
         }
-        log('Outlook OTP source: emailManage direct latest-code, email=' + ((data && data.email) || email));
-        return otp;
+        log('Outlook OTP source: local outlook pool, email=' + ((localData && localData.email) || email));
+        return localOtp;
     }
 
     let chatGptLoginClicked = false;
@@ -945,7 +1411,8 @@ var CONFIG = {
                     emailFilled = false;
                     continue;
                 }
-                saveEmailVerificationStartedAt(Date.now() / 1000);
+                var verificationStartedAt = saveEmailVerificationStartedAt(Date.now() / 1000);
+                saveEmailVerificationResendState(account, verificationStartedAt, 0, 0);
                 robustClickElement(continueBtn);
                 updateProgress(100, '已填写 ChatGPT 邮箱并点击继续');
                 log('✅ 已点击邮箱表单的继续按钮');
@@ -1110,6 +1577,44 @@ var CONFIG = {
         return false;
     }
 
+    function isEmailVerificationResendButton(btn) {
+        if (!btn) return false;
+        var text = (btn.textContent || '').trim().toLowerCase();
+        var name = (btn.getAttribute('name') || '').toLowerCase();
+        var value = (btn.getAttribute('value') || '').toLowerCase();
+        var rect = btn.getBoundingClientRect();
+        return !btn.disabled && btn.getAttribute('aria-disabled') !== 'true' && rect.width > 0 && rect.height > 0 && (
+            (name === 'intent' && value === 'resend') ||
+            value === 'resend' ||
+            text.includes('重新发送电子邮件') ||
+            text.includes('重新发送') ||
+            text.includes('resend email') ||
+            text.includes('resend')
+        );
+    }
+
+    function isEmailVerificationSubmitButton(btn) {
+        if (!btn || isEmailVerificationResendButton(btn)) return false;
+        var text = (btn.textContent || '').trim();
+        var rect = btn.getBoundingClientRect();
+        var value = (btn.getAttribute('value') || '').toLowerCase();
+        return !btn.disabled && btn.getAttribute('aria-disabled') !== 'true' && rect.width > 0 && rect.height > 0 && (
+            value === 'continue' ||
+            value === 'verify' ||
+            text.includes('继续') ||
+            text.toLowerCase().includes('continue') ||
+            text.includes('验证') ||
+            text.toLowerCase().includes('verify')
+        );
+    }
+
+    function findEmailVerificationResendButton() {
+        var buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
+        return buttons.find(function(btn) {
+            return isEmailVerificationResendButton(btn);
+        }) || null;
+    }
+
     function findEmailVerificationSubmitButton() {
         var codeInput = findEmailVerificationCodeInput();
         var form = null;
@@ -1117,79 +1622,203 @@ var CONFIG = {
             var formId = codeInput.getAttribute('form');
             form = formId ? document.getElementById(formId) : codeInput.closest('form');
         }
-        var formButton = form ? form.querySelector('button[type="submit"], button') : null;
+        var formButtons = form ? Array.from(form.querySelectorAll('button[type="submit"], button')) : [];
+        var formButton = formButtons.find(function(btn) {
+            return isEmailVerificationSubmitButton(btn);
+        }) || null;
         if (formButton) return formButton;
 
         var buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
         return buttons.find(function(btn) {
-            var text = (btn.textContent || '').trim();
-            var rect = btn.getBoundingClientRect();
-            return !btn.disabled && rect.width > 0 && rect.height > 0 && (
-                text.includes('继续') ||
-                text.toLowerCase().includes('continue') ||
-                text.includes('验证') ||
-                text.toLowerCase().includes('verify')
-            );
+            return isEmailVerificationSubmitButton(btn);
         }) || null;
     }
 
-    async function autoFillEmailVerificationCode() {
-        if (!loadEmailVerificationStartedAt()) saveEmailVerificationStartedAt(Date.now() / 1000);
-        var maxWait = 15000;
-        var waited = 0;
-        var step = 300;
-        var codeFilled = false;
-        var account;
-        var code;
+    function describeEmailVerificationElement(el) {
+        if (!el) return 'missing';
+        var rect = el.getBoundingClientRect();
+        return [
+            el.tagName.toLowerCase(),
+            el.id ? '#' + el.id : '',
+            el.name ? '[name="' + el.name + '"]' : '',
+            el.getAttribute('type') ? '[type="' + el.getAttribute('type') + '"]' : '',
+            el.disabled ? 'disabled' : 'enabled',
+            Math.round(rect.width) + 'x' + Math.round(rect.height),
+        ].filter(Boolean).join('');
+    }
 
-        try {
-            account = await ensureOutlookAccount();
-            updateProgress(20, 'Fetching Outlook OTP...');
-            code = await fetchOutlookOtp(account.email);
-            if (!code) throw new Error('Empty OTP');
-            log('Fetched Outlook OTP for ' + account.email + ': ' + code);
-        } catch (e) {
-            clearCurrentOutlookAccount();
-            updateProgress(0, '获取 Outlook 验证码失败，请手动输入');
-            log('获取 Outlook 验证码失败，请手动输入: ' + e.message);
+    function describeEmailVerificationButton(btn) {
+        if (!btn) return 'missing';
+        var rect = btn.getBoundingClientRect();
+        return [
+            'text="' + (btn.textContent || '').trim() + '"',
+            btn.name ? '[name="' + btn.name + '"]' : '',
+            btn.value ? '[value="' + btn.value + '"]' : '',
+            btn.disabled ? 'disabled' : 'enabled',
+            btn.getAttribute('aria-disabled') === 'true' ? 'aria-disabled=true' : '',
+            Math.round(rect.width) + 'x' + Math.round(rect.height),
+        ].filter(Boolean).join(', ');
+    }
+
+    async function autoFillEmailVerificationCodeWithResend() {
+        if (emailVerificationAutoFillRunning) {
+            log('邮箱验证码自动处理已在运行，本次 runScript 跳过，避免重复点击重新发送');
             return false;
         }
+        emailVerificationAutoFillRunning = true;
+        try {
+            return await autoFillEmailVerificationCodeWithResendInner();
+        } finally {
+            emailVerificationAutoFillRunning = false;
+        }
+    }
+
+    async function autoFillEmailVerificationCodeWithResendInner() {
+        var nowSeconds = Date.now() / 1000;
+        var startedAt = loadEmailVerificationStartedAt();
+        if (!startedAt || nowSeconds - startedAt > 15 * 60) {
+            startedAt = saveEmailVerificationStartedAt(nowSeconds);
+        }
+        var pageEnteredAt = nowSeconds;
+
+        var account;
+        try {
+            account = await ensureOutlookAccount();
+            updateProgress(20, '正在轮询 Outlook 验证码...');
+            log('Email verification mailbox: ' + account.email + ', started_at=' + startedAt);
+        } catch (e) {
+            updateProgress(0, '领取 Outlook 邮箱失败，请手动输入验证码');
+            log('领取 Outlook 邮箱失败，请手动输入验证码: ' + e.message);
+            return false;
+        }
+
+        var maxWait = 180000;
+        var waited = 0;
+        var step = 300;
+        var resendAfterSeconds = 90;
+        var maxResends = 1;
+        var minPageWaitBeforeResend = 20;
+        var resendState = loadEmailVerificationResendState(account, startedAt);
+        var resendCount = resendState ? resendState.resend_count : 0;
+        if (!resendState) saveEmailVerificationResendState(account, startedAt, resendCount, 0);
+        var code = '';
+        var codeFilled = false;
+        var otpFetchInFlight = null;
+        var otpPollGeneration = 0;
+        var nextOtpPollAt = 0;
+        var lastOtpError = '';
+        var lastDiagnostics = '';
+        var resendMissingLoggedFor = -1;
 
         while (waited < maxWait) {
             if (STATE === 'STOPPED') return false;
 
-            if (!codeFilled) {
+            var input = findEmailVerificationCodeTarget();
+            var submitBtn = findEmailVerificationSubmitButton();
+            var resendBtn = findEmailVerificationResendButton();
+            var currentValue = getCurrentOtpValue();
+            var currentStartedAt = loadEmailVerificationStartedAt() || startedAt;
+            var elapsedFromEmailStart = Date.now() / 1000 - currentStartedAt;
+            var elapsedOnPage = Date.now() / 1000 - pageEnteredAt;
+
+            var diagnostics = 'Email verification 状态: input=' + describeEmailVerificationElement(input) +
+                ', submit=' + describeEmailVerificationButton(submitBtn) +
+                ', resend=' + describeEmailVerificationButton(resendBtn) +
+                ', resendCount=' + resendCount +
+                ', lastOtpError=' + (lastOtpError || '-');
+            if (diagnostics !== lastDiagnostics) {
+                log(diagnostics);
+                lastDiagnostics = diagnostics;
+            }
+
+            if (!code && currentValue.length === 6) {
+                code = currentValue;
+                codeFilled = true;
+                log('检测到页面已有 6 位验证码，准备提交: ' + code);
+            }
+
+            if (!code && !otpFetchInFlight && Date.now() >= nextOtpPollAt) {
+                var pollGeneration = otpPollGeneration;
+                otpFetchInFlight = fetchOutlookOtp(account.email, { maxWait: 2, pollInterval: 1 })
+                    .then(function(found) {
+                        if (pollGeneration !== otpPollGeneration) return;
+                        var normalized = String(found || '').replace(/\D/g, '');
+                        if (normalized.length === 6) {
+                            code = normalized;
+                            codeFilled = false;
+                            lastOtpError = '';
+                            updateProgress(55, '已获取 Outlook 验证码，准备填入页面...');
+                            log('Fetched Outlook OTP for ' + account.email + ': ' + code);
+                        } else if (normalized) {
+                            lastOtpError = '忽略非 6 位验证码: ' + normalized;
+                        }
+                    })
+                    .catch(function(e) {
+                        if (pollGeneration !== otpPollGeneration) return;
+                        lastOtpError = e && e.message ? e.message : String(e);
+                    })
+                    .then(function() {
+                        if (pollGeneration !== otpPollGeneration) return;
+                        otpFetchInFlight = null;
+                        nextOtpPollAt = Date.now() + 5000;
+                    });
+            }
+
+            if (code && !codeFilled) {
                 codeFilled = fillSplitOtpInputs(code);
-                if (!codeFilled) {
-                    var target = findEmailVerificationCodeTarget();
-                    if (target) codeFilled = setElementTextLikeInput(target, code);
+                if (!codeFilled && input) {
+                    codeFilled = setElementTextLikeInput(input, code);
                 }
                 if (codeFilled) {
                     updateProgress(65, '已填写邮箱验证码，等待确认按钮...');
-                    log('✅ 已填写邮箱验证码: ' + code + '，当前页面值: ' + getCurrentOtpValue());
+                    log('已填写邮箱验证码: ' + code + '，当前页面值: ' + getCurrentOtpValue());
                 }
             }
 
-            var btn = findEmailVerificationSubmitButton();
-            if (codeFilled && btn && getCurrentOtpValue() === code) {
+            if (codeFilled && submitBtn && getCurrentOtpValue() === code) {
                 await safeWait(800);
                 if (getCurrentOtpValue() !== code) {
                     codeFilled = false;
                     continue;
                 }
-                robustClickElement(btn);
+                robustClickElement(submitBtn);
                 updateProgress(100, '已填写验证码并点击确认按钮');
-                log('✅ 已点击邮箱验证码确认按钮');
+                log('已点击邮箱验证码确认按钮');
                 return true;
+            }
+
+            if (!code && elapsedFromEmailStart >= resendAfterSeconds && elapsedOnPage >= minPageWaitBeforeResend && resendCount < maxResends) {
+                if (resendBtn) {
+                    robustClickElement(resendBtn);
+                    resendCount++;
+                    otpPollGeneration++;
+                    otpFetchInFlight = null;
+                    code = '';
+                    codeFilled = false;
+                    startedAt = saveEmailVerificationStartedAt(Date.now() / 1000);
+                    saveEmailVerificationResendState(account, startedAt, resendCount, startedAt);
+                    nextOtpPollAt = 0;
+                    resendMissingLoggedFor = -1;
+                    updateProgress(35, '90 秒未收到验证码，已点击重新发送电子邮件 (' + resendCount + '/' + maxResends + ')');
+                    log('90 秒未收到 6 位验证码，已点击重新发送电子邮件，resendCount=' + resendCount);
+                    await safeWait(1000);
+                } else if (resendMissingLoggedFor !== resendCount) {
+                    resendMissingLoggedFor = resendCount;
+                    log('90 秒未收到验证码，但未找到可点击的重新发送电子邮件按钮');
+                }
             }
 
             await safeWait(step);
             waited += step;
         }
 
-        updateProgress(10, '未找到邮箱验证码输入区域或确认按钮');
-        log('未找到邮箱验证码输入区域或确认按钮');
+        updateProgress(10, '邮箱验证码未自动完成，请手动处理');
+        log('邮箱验证码自动处理超时；最后状态: ' + (lastDiagnostics || '无可见候选元素') + ', lastOtpError=' + (lastOtpError || '-'));
         return false;
+    }
+
+    async function autoFillEmailVerificationCode() {
+        return await autoFillEmailVerificationCodeWithResend();
     }
 
     function randomChatGptFullName() {
@@ -1198,11 +1827,23 @@ var CONFIG = {
         return firstNames[Math.floor(Math.random() * firstNames.length)] + ' ' + lastNames[Math.floor(Math.random() * lastNames.length)];
     }
 
+    function normalizeMatchText(text) {
+        return String(text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    }
+
+    function textMatchesAny(text, matchers) {
+        var normalized = normalizeMatchText(text);
+        return matchers.some(function(matcher) {
+            return normalized.includes(normalizeMatchText(matcher));
+        });
+    }
+
     function findInputByVisibleLabel(labelText) {
+        var matchers = Array.isArray(labelText) ? labelText : [labelText];
         var labels = Array.from(document.querySelectorAll('label'));
         for (var i = 0; i < labels.length; i++) {
             var label = labels[i];
-            if (!(label.textContent || '').includes(labelText)) continue;
+            if (!textMatchesAny(label.textContent || '', matchers)) continue;
 
             var forId = label.getAttribute('for');
             if (forId) {
@@ -1223,6 +1864,25 @@ var CONFIG = {
         return null;
     }
 
+    function queryVisibleInputByAttrs(matchers) {
+        var inputs = Array.from(document.querySelectorAll('input, textarea'));
+        return inputs.find(function(el) {
+            if (!el || el.disabled || !('value' in el)) return false;
+            var rect = el.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) return false;
+            var haystack = [
+                el.id,
+                el.name,
+                el.getAttribute('autocomplete'),
+                el.getAttribute('aria-label'),
+                el.getAttribute('placeholder'),
+                el.getAttribute('data-testid'),
+                el.getAttribute('type'),
+            ].filter(Boolean).join(' ');
+            return textMatchesAny(haystack, matchers);
+        }) || null;
+    }
+
     function getVisibleInputFromCandidates(candidates) {
         for (var i = 0; i < candidates.length; i++) {
             var el = candidates[i];
@@ -1235,11 +1895,13 @@ var CONFIG = {
 
     function findAboutYouFullNameInput() {
         return getVisibleInputFromCandidates([
-            findInputByVisibleLabel('全名'),
+            findInputByVisibleLabel(['全名', 'full name', 'name']),
             document.querySelector('input[name="name"]'),
             document.querySelector('input[name="fullName"]'),
             document.querySelector('input[name="full_name"]'),
+            document.querySelector('input[name="full-name"]'),
             document.querySelector('input[autocomplete="name"]'),
+            queryVisibleInputByAttrs(['full name', 'full_name', 'full-name', 'name', '全名']),
             document.querySelector('input[aria-label*="全名"]'),
             document.querySelector('input[placeholder*="全名"]'),
         ]);
@@ -1247,28 +1909,105 @@ var CONFIG = {
 
     function findAboutYouAgeInput() {
         return getVisibleInputFromCandidates([
-            findInputByVisibleLabel('年龄'),
+            findInputByVisibleLabel(['年龄', 'age', 'birthday', 'birth date', 'date of birth', '出生日期', '生日']),
             document.querySelector('input[name="age"]'),
+            document.querySelector('input[name="birthday"]'),
+            document.querySelector('input[name="birthdate"]'),
+            document.querySelector('input[name="birth_date"]'),
+            document.querySelector('input[name="dateOfBirth"]'),
+            document.querySelector('input[name="date_of_birth"]'),
+            queryVisibleInputByAttrs(['age', 'birthday', 'birthdate', 'birth date', 'date of birth', '出生日期', '生日', '年龄']),
             document.querySelector('input[aria-label*="年龄"]'),
             document.querySelector('input[placeholder*="年龄"]'),
             document.querySelector('input[inputmode="numeric"]'),
             document.querySelector('input[type="number"]'),
+            document.querySelector('input[type="date"]'),
         ]);
     }
 
-    function findAboutYouSubmitButton() {
+    function isAboutYouSubmitButton(btn, allowDisabled) {
+        if (!btn) return false;
+        var text = (btn.textContent || '').trim();
+        var normalizedText = normalizeMatchText(text);
+        var rect = btn.getBoundingClientRect();
+        var actionName = btn.getAttribute('data-dd-action-name') || '';
+        var name = btn.getAttribute('name') || '';
+        var testId = btn.getAttribute('data-testid') || '';
+        var attrText = normalizeMatchText([actionName, name, testId].join(' '));
+        var enabled = !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
+        if ((!allowDisabled && !enabled) || rect.width <= 0 || rect.height <= 0) return false;
+        return (
+            attrText.includes('continue') ||
+            attrText.includes('submit') ||
+            normalizedText.includes('continue') ||
+            normalizedText.includes('next') ||
+            normalizedText.includes('done') ||
+            normalizedText.includes('complete account creation') ||
+            normalizedText.includes('complete account setup') ||
+            normalizedText.includes('完成帐户创建') ||
+            normalizedText.includes('完成账户创建') ||
+            normalizedText.includes('完成') ||
+            normalizedText.includes('继续')
+        );
+    }
+
+    function findAboutYouFormRoot(nameInput, ageInput) {
+        var roots = [nameInput, ageInput].filter(Boolean).map(function(input) {
+            return input.closest('form') || input.closest('main') || input.closest('[role="main"]') || input.closest('section') || input.closest('div');
+        }).filter(Boolean);
+        return roots[0] || document;
+    }
+
+    function findAboutYouSubmitButton(nameInput, ageInput, allowDisabled) {
+        var root = findAboutYouFormRoot(nameInput, ageInput);
+        var scopedButtons = Array.from(root.querySelectorAll ? root.querySelectorAll('button[type="submit"], button') : []);
+        var btn = scopedButtons.find(function(candidate) {
+            return isAboutYouSubmitButton(candidate, allowDisabled);
+        });
+        if (btn) return btn;
+
         var buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
-        return buttons.find(function(btn) {
-            var text = (btn.textContent || '').trim();
-            var rect = btn.getBoundingClientRect();
-            var actionName = btn.getAttribute('data-dd-action-name') || '';
-            return !btn.disabled && btn.getAttribute('aria-disabled') !== 'true' && rect.width > 0 && rect.height > 0 && (
-                actionName === 'Continue' ||
-                text.includes('完成帐户创建') ||
-                text.includes('完成账户创建') ||
-                text.toLowerCase().includes('continue')
-            );
+        return buttons.find(function(candidate) {
+            return isAboutYouSubmitButton(candidate, allowDisabled);
         }) || null;
+    }
+
+    function describeAboutYouElement(el) {
+        if (!el) return 'missing';
+        var rect = el.getBoundingClientRect();
+        return [
+            el.tagName.toLowerCase(),
+            el.id ? '#' + el.id : '',
+            el.name ? '[name="' + el.name + '"]' : '',
+            el.getAttribute('type') ? '[type="' + el.getAttribute('type') + '"]' : '',
+            el.disabled ? 'disabled' : 'enabled',
+            Math.round(rect.width) + 'x' + Math.round(rect.height),
+        ].filter(Boolean).join('');
+    }
+
+    function describeAboutYouButton(btn) {
+        if (!btn) return 'missing';
+        var rect = btn.getBoundingClientRect();
+        return [
+            'text="' + (btn.textContent || '').trim() + '"',
+            btn.disabled ? 'disabled' : 'enabled',
+            btn.getAttribute('aria-disabled') === 'true' ? 'aria-disabled=true' : '',
+            Math.round(rect.width) + 'x' + Math.round(rect.height),
+        ].filter(Boolean).join(', ');
+    }
+
+    function getAboutYouAgeValue(ageInput) {
+        var type = normalizeMatchText(ageInput && ageInput.getAttribute('type'));
+        var attrs = normalizeMatchText([
+            ageInput && ageInput.name,
+            ageInput && ageInput.id,
+            ageInput && ageInput.getAttribute('aria-label'),
+            ageInput && ageInput.getAttribute('placeholder'),
+        ].filter(Boolean).join(' '));
+        if (type === 'date' || attrs.includes('birthday') || attrs.includes('birthdate') || attrs.includes('date of birth')) {
+            return '2003-01-01';
+        }
+        return '23';
     }
 
     async function autoFillAboutYou() {
@@ -1277,6 +2016,7 @@ var CONFIG = {
         var step = 300;
         var fullName = randomChatGptFullName();
         var age = '23';
+        var lastDiagnostics = '';
         var filled = false;
 
         while (waited < maxWait) {
@@ -1284,21 +2024,31 @@ var CONFIG = {
 
             var nameInput = findAboutYouFullNameInput();
             var ageInput = findAboutYouAgeInput();
+            var ageValue = ageInput ? getAboutYouAgeValue(ageInput) : age;
 
             if (nameInput && ageInput && !filled) {
                 var nameOk = setElementTextLikeInput(nameInput, fullName);
-                var ageOk = setElementTextLikeInput(ageInput, age);
-                filled = nameOk && ageOk && nameInput.value === fullName && ageInput.value === age;
+                var ageOk = setElementTextLikeInput(ageInput, ageValue);
+                filled = nameOk && ageOk && nameInput.value === fullName && ageInput.value === ageValue;
                 if (filled) {
                     updateProgress(65, '已填写全名和年龄，等待完成按钮...');
                     log('✅ 已填写 About You: ' + fullName + ', age=' + age);
                 }
             }
 
-            var btn = findAboutYouSubmitButton();
-            if (filled && btn && nameInput && ageInput && nameInput.value === fullName && ageInput.value === age) {
+            var btn = findAboutYouSubmitButton(nameInput, ageInput, false);
+            var diagnosticBtn = btn || findAboutYouSubmitButton(nameInput, ageInput, true);
+            var diagnostics = 'About You 状态: name=' + describeAboutYouElement(nameInput) +
+                ', age/birthday=' + describeAboutYouElement(ageInput) +
+                ', submit=' + describeAboutYouButton(diagnosticBtn);
+            if (diagnostics !== lastDiagnostics) {
+                log(diagnostics);
+                lastDiagnostics = diagnostics;
+            }
+
+            if (filled && btn && nameInput && ageInput && nameInput.value === fullName && ageInput.value === ageValue) {
                 await safeWait(800);
-                if (nameInput.value !== fullName || ageInput.value !== age) {
+                if (nameInput.value !== fullName || ageInput.value !== ageValue) {
                     filled = false;
                     continue;
                 }
@@ -1313,7 +2063,7 @@ var CONFIG = {
         }
 
         updateProgress(10, '未找到全名/年龄输入框或完成按钮');
-        log('未找到 About You 全名/年龄输入框或完成按钮');
+        log('未找到 About You 全名/年龄输入框或完成按钮；最后状态: ' + (lastDiagnostics || '无可见候选元素'));
         return false;
     }
 
@@ -1373,18 +2123,20 @@ var CONFIG = {
                 log('按钮被禁用或不可见，等待中...');
                 if (retries < 12) {
                     await safeWait(800);
-                    await clickBtnAsync(retries + 1);
+                    return await clickBtnAsync(retries + 1);
                 }
-                return;
+                return false;
             }
             log('正在点击按钮: ' + btn.textContent.trim());
             btn.click();
+            return true;
         } else {
             log('未找到提交按钮，重试中... (' + retries + ')');
             if (retries < 12) {
                 await safeWait(800);
-                await clickBtnAsync(retries + 1);
+                return await clickBtnAsync(retries + 1);
             }
+            return false;
         }
     }
 
@@ -1394,6 +2146,16 @@ var CONFIG = {
         var path = window.location.pathname;
 
         try {
+            if (
+                host.includes('chatgpt.com') ||
+                host.includes('chat.openai.com') ||
+                host.includes('pay.openai.com') ||
+                host.includes('checkout.stripe.com') ||
+                host.includes('paypal.com')
+            ) {
+                await checkAndMarkPendingPlusIfReady();
+            }
+
             // ============================================
             // -- 场景〇：ChatGPT主站 (等待点击按钮获取链接) --
             // ============================================
@@ -1453,7 +2215,13 @@ var CONFIG = {
 
                 updateProgress(95, '准备提交结算...');
                 await safeWait(1500);
-                await clickBtnAsync();
+                var stripeSubmitted = await clickBtnAsync();
+                if (stripeSubmitted) {
+                    savePlusMarkPendingFromCurrentAccount();
+                    await checkAndMarkPendingPlusIfReady();
+                } else {
+                    log('未确认已点击最终提交按钮，跳过 GPT Plus 状态更新');
+                }
 
                 updateProgress(100, '✅ Stripe 脚本流程执行完毕');
                 return;
@@ -1517,7 +2285,13 @@ var CONFIG = {
 
                 updateProgress(90, '信息填充完毕，准备提交付款...');
                 await safeWait(1200);
-                await clickBtnAsync();
+                var paypalSubmitted = await clickBtnAsync();
+                if (paypalSubmitted) {
+                    savePlusMarkPendingFromCurrentAccount();
+                    await checkAndMarkPendingPlusIfReady();
+                } else {
+                    log('未确认已点击最终提交按钮，跳过 GPT Plus 状态更新');
+                }
 
                 updateProgress(100, '✅ 结账脚本流程执行完毕');
                 return;
@@ -1536,8 +2310,54 @@ var CONFIG = {
         }
     }
 
+    var lastRunRouteKey = '';
+    var routeRunTimer = null;
+
+    function currentRouteKey() {
+        return window.location.host + window.location.pathname;
+    }
+
+    function scheduleRunScript(reason) {
+        var routeKey = currentRouteKey();
+        if (reason !== 'initial' && routeKey === lastRunRouteKey) return;
+        lastRunRouteKey = routeKey;
+
+        if (routeRunTimer) clearTimeout(routeRunTimer);
+        routeRunTimer = setTimeout(function() {
+            if (reason !== 'initial') {
+                log('检测到页面路径变化，重新匹配任务: ' + window.location.pathname);
+            }
+            runScript();
+        }, 150);
+    }
+
+    function installLocationChangeWatcher() {
+        var pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        var pageHistory = pageWindow.history || history;
+        var notify = function(reason) {
+            setTimeout(function() {
+                scheduleRunScript(reason);
+            }, 0);
+        };
+
+        ['pushState', 'replaceState'].forEach(function(method) {
+            var original = pageHistory[method];
+            if (typeof original !== 'function') return;
+            pageHistory[method] = function() {
+                var result = original.apply(this, arguments);
+                notify(method);
+                return result;
+            };
+        });
+
+        pageWindow.addEventListener('popstate', function() {
+            notify('popstate');
+        });
+    }
+
     // 初始化UI并运行脚本
     initUI();
-    runScript();
+    installLocationChangeWatcher();
+    scheduleRunScript('initial');
 
 })();
